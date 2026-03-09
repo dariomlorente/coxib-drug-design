@@ -23,7 +23,7 @@ conda activate coxibs
 
 ## Computational Pipeline
 
-Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the Enamine commercial catalogue and filtered by price, bioavailability (Veber criteria), and structural alerts (Brenk + PAINS). Filtered sets are then combined through three encoded reaction pathways:
+Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the Enamine commercial catalogue and filtered by price and bioavailability (Veber criteria). Filtered sets are then combined through three encoded reaction pathways. The resulting products (imidazolones and thiazolones) are filtered for structural alerts (Brenk + PAINS) before export:
 
 | Step | Reaction | Inputs | Output |
 |------|----------|--------|--------|
@@ -31,16 +31,18 @@ Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the
 | 2 | Aminolysis (GFPc variant) | Oxazolones + Amines | Imidazolones |
 | 3 | Sulphur exchange | Oxazolones | Thiazolones |
 
-Reactions are implemented as RDKit SMARTS templates. The resulting library is re-assessed for drug-likeness before export.
+Reactions are implemented as RDKit SMARTS templates. The resulting library is re-assessed for drug-likeness before export. The `filter_BrenkPAINS` function removes compounds with structural alerts.
 
 ## Repository Structure
 
-```
-py_utils/               Python package: reactions, filters, I/O, pricing client
-mol_files/              Input SDFs (tracked) and generated outputs (gitignored)
-01_library_generation.ipynb  Library generation notebook
-env.yaml                Conda environment specification
-```
+| Path | Description |
+|------|-------------|
+| `py_utils/` | Python package: reactions, filters, I/O, pricing client |
+| `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
+| `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
+| `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization |
+| `03_activity_prediction.ipynb` | Phase 3: *In silico* activity prediction |
+| `env.yaml` | Conda environment specification |
 
 ## Author
 

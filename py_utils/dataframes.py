@@ -19,7 +19,7 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, Lipinski, MolToSmiles, SDWriter, rdMolDescriptors
 from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 
-from py_utils.resources import _get_n_workers
+from py_utils._resources import _get_n_workers
 
 
 # Cache directory for persistent storage
@@ -786,7 +786,7 @@ def cleanup_generated_files(base_path: str = ".", verbose: bool = True) -> None:
         print(f"[Cleanup] Removed {removed_count} generated files/directories")
 
 
-def filter_brenk(
+def filter_BrenkPAINS(
     df: pd.DataFrame,
     smiles_col: str = "SMILES",
     id_col: str = "ID",
@@ -794,15 +794,17 @@ def filter_brenk(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Filter out compounds containing Brenk structural alerts or PAINS substructures.
 
-    Applies two complementary toxicophore screens in a single pass using RDKit's
-    built-in FilterCatalog:
+    Two-stage filter:
       1. **Brenk alerts** — functional groups associated with poor ADMET or
          mutagenicity (Brenk et al., J. Chem. Inf. Model. 2008).
       2. **PAINS** — pan-assay interference compounds (Baell & Holloway,
-         J. Med. Chem. 2010).
+         J. Med. Chem. 2010). Organized by class (a, b, c).
 
-    Molecules that fail to parse are rejected with reason ``"invalid_smiles"``.
-    Rejected rows retain a ``Rejection_Reasons`` column with the matched alert name.
+    Rejected compounds get two extra columns in the rejected DataFrame:
+      - MatchAlert: "Brenk", "PAINS(a)", "PAINS(b)", "PAINS(c)", or "invalid_smiles"
+      - Substructure: the specific alert/filter name that matched
+
+    Molecules that fail to parse are marked as "invalid_smiles".
 
     Parameters:
         df: Input DataFrame — must contain ``smiles_col`` and ``id_col``.
@@ -816,42 +818,96 @@ def filter_brenk(
     Raises:
         ValueError: If required columns are missing.
     """
+    from py_utils._smarts_catalog import BRENK_ALERTS, PAINS_ALERTS
+
     if smiles_col not in df.columns:
         raise ValueError(f"Missing column '{smiles_col}'.")
     if id_col not in df.columns:
         raise ValueError(f"Missing column '{id_col}'.")
 
-    params = FilterCatalogParams()
-    params.AddCatalog(FilterCatalogParams.FilterCatalogs.BRENK)
-    params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
-    catalog = FilterCatalog(params)
+    out_df = df.copy()
 
-    rejection_reasons = []
-    for smi in df[smiles_col].astype(str):
+    # First stage: Brenk filtering
+    brenk_match_alerts: list[str] = []
+    brenk_substructures: list[str] = []
+    compiled_brenk: list[tuple[str, Chem.Mol | None]] = []
+    
+    for alert_name, smarts in BRENK_ALERTS.items():
+        patt = Chem.MolFromSmarts(smarts)
+        compiled_brenk.append((alert_name, patt))
+
+    for smi in out_df[smiles_col].astype(str):
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
-            rejection_reasons.append("invalid_smiles")
+            brenk_match_alerts.append("invalid_smiles")
+            brenk_substructures.append("")
             continue
-        entry = catalog.GetFirstMatch(mol)
-        rejection_reasons.append(entry.GetDescription() if entry is not None else "")
+        
+        matched = False
+        for alert_name, patt in compiled_brenk:
+            if patt and mol.HasSubstructMatch(patt):
+                brenk_match_alerts.append("Brenk")
+                brenk_substructures.append(alert_name)
+                matched = True
+                break
+        if not matched:
+            brenk_match_alerts.append("")
+            brenk_substructures.append("")
 
-    df_work = df.copy()
-    df_work["Rejection_Reasons"] = rejection_reasons
-    mask_rejected = df_work["Rejection_Reasons"] != ""
+    out_df["MatchAlert"] = brenk_match_alerts
+    out_df["Substructure"] = brenk_substructures
+    
+    # Keep accepted Brenk compounds for PAINS filtering
+    brenk_accepted = out_df[out_df["MatchAlert"] == ""].copy()
+    brenk_rejected = out_df[out_df["MatchAlert"] != ""].copy()
+    
+    # Second stage: PAINS filtering (on Brenk-accepted compounds only)
+    pains_match_alerts: list[str] = []
+    pains_substructures: list[str] = []
+    compiled_pains: list[tuple[str, str, Chem.Mol | None]] = []
+    
+    for pains_class, smarts_dict in PAINS_ALERTS.items():
+        for filter_name, smarts in smarts_dict.items():
+            patt = Chem.MolFromSmarts(smarts)
+            compiled_pains.append((pains_class, filter_name, patt))
 
-    df_rejected = df_work[mask_rejected].copy().reset_index(drop=True)
-    df_accepted = (
-        df_work[~mask_rejected]
-        .drop(columns=["Rejection_Reasons"])
-        .copy()
-        .reset_index(drop=True)
-    )
+    for smi in brenk_accepted[smiles_col].astype(str):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            pains_match_alerts.append("invalid_smiles")
+            pains_substructures.append("")
+            continue
+        
+        matched = False
+        for pains_class, filter_name, patt in compiled_pains:
+            if patt and mol.HasSubstructMatch(patt):
+                pains_match_alerts.append(f"PAINS({pains_class})")
+                pains_substructures.append(filter_name)
+                matched = True
+                break
+        if not matched:
+            pains_match_alerts.append("")
+            pains_substructures.append("")
+    
+    brenk_accepted["MatchAlert"] = pains_match_alerts
+    brenk_accepted["Substructure"] = pains_substructures
+    
+    # Final results
+    pains_rejected = brenk_accepted[brenk_accepted["MatchAlert"] != ""].copy()
+    pains_accepted = brenk_accepted[brenk_accepted["MatchAlert"] == ""].copy()
+    
+    # Combine rejected from both stages
+    df_rejected = pd.concat([brenk_rejected, pains_rejected], ignore_index=True)
+    df_accepted = pains_accepted.drop(columns=["MatchAlert", "Substructure"]).reset_index(drop=True)
+    df_rejected = df_rejected.reset_index(drop=True)
 
     if print_report:
         n_total = len(df)
+        n_brenk_rejected = len(brenk_rejected)
+        n_pains_rejected = len(pains_rejected)
         n_accepted = len(df_accepted)
-        n_rejected = len(df_rejected)
         pct = (n_accepted / n_total * 100) if n_total > 0 else 0
-        print(f"[filter_brenk] {n_accepted}/{n_total} accepted ({pct:.1f}%), {n_rejected} rejected")
+        print(f"[filter_BrenkPAINS] {n_accepted}/{n_total} accepted ({pct:.1f}%)")
+        print(f"[filter_BrenkPAINS] Rejected: Brenk={n_brenk_rejected}, PAINS={n_pains_rejected}")
 
     return df_accepted, df_rejected

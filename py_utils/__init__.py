@@ -1,6 +1,6 @@
 """
 Cheminformatics utilities for virtual screening and compound generation.
-Modules: chemistry, dataframes, enamine_api, resources.
+Modules: chemistry, dataframes, enamine_api, _resources.
 """
 
 from .chemistry import (
@@ -27,7 +27,7 @@ from .dataframes import (
     add_rdkit_properties,
     filter_Veber,
     filter_by_properties,
-    filter_brenk,
+    filter_BrenkPAINS,
     add_dicarboxylic_flag,
     digest,
     cleanup_generated_files,
@@ -39,7 +39,7 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-__version__ = "3.7"  # Month.Day - Phase 2b pipeline: filter_brenk, rxn_AminolysisGFPc, rxn_SulphurExchange, EnamineClient
+__version__ = "3.9"  # Month.Day - pipeline restructure: Brenk+PAINS on products only
 __author__ = "Dario M Lorente"
 
 __all__ = [
@@ -62,7 +62,7 @@ __all__ = [
     "add_rdkit_properties",
     "filter_Veber",
     "filter_by_properties",
-    "filter_brenk",
+    "filter_BrenkPAINS",
     "add_dicarboxylic_flag",
     "digest",
     "cleanup_generated_files",

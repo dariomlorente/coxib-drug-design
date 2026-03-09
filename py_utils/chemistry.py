@@ -16,7 +16,7 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors, rdChemReactions
 
-from py_utils.resources import _get_n_workers, _get_ram_budget_gb
+from py_utils._resources import _get_n_workers, _get_ram_budget_gb
 
 
 # Cache directory for persistent storage
