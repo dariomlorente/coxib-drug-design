@@ -247,9 +247,7 @@ def add_rdkit_properties(df: pd.DataFrame) -> pd.DataFrame:
 
     if invalid_mask.any():
         removed = out.loc[invalid_mask, ["ID", "SMILES"]]
-        print("⚠️ Removed invalid SMILES rows:")
-        for _, row in removed.iterrows():
-            print(f"  - ID={row['ID']}, SMILES='{row['SMILES']}'")
+        print(f"⚠️  Removed {len(removed)} invalid SMILES rows")
 
     out = out.loc[~invalid_mask].reset_index(drop=True)
     mols = mols.loc[~invalid_mask]

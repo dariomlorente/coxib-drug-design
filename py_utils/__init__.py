@@ -4,15 +4,9 @@ Modules: chemistry, dataframes, enamine_api, _resources.
 """
 
 from .chemistry import (
-    rxn_SchottenBaumann,
     rxn_ErlenmeyerPlochl,
-    rxn_DivergenceSe34,
-    rxn_DivergenceSe34_chunked,
-    deduplicate_chunks,
     rxn_AminolysisGFPc,
     rxn_SulphurExchange,
-    _rxn_DivergenceSe34_single,
-    _process_azlactone_batch,
     _process_ep_batch,
 )
 
@@ -39,16 +33,12 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-__version__ = "3.9"  # Month.Day - pipeline restructure: Brenk+PAINS on products only
+__version__ = "4.0"  # Month.Day - Erlenmeyer-Plochl direct 3-reactant reaction, removed Se-34
 __author__ = "Dario M Lorente"
 
 __all__ = [
     # Chemistry
-    "rxn_SchottenBaumann",
     "rxn_ErlenmeyerPlochl",
-    "rxn_DivergenceSe34",
-    "rxn_DivergenceSe34_chunked",
-    "deduplicate_chunks",
     "rxn_AminolysisGFPc",
     "rxn_SulphurExchange",
     # DataFrames
