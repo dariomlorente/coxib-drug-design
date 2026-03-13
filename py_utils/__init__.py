@@ -33,7 +33,7 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-__version__ = "4.0"  # Month.Day - Erlenmeyer-Plochl direct 3-reactant reaction, removed Se-34
+__version__ = "3.13"  # Month.Day - Aminolysis-GFPc reaction implementation
 __author__ = "Dario M Lorente"
 
 __all__ = [

@@ -82,7 +82,7 @@ BRENK_ALERTS: dict[str, str] = {
     "isolated alkene":                          "[$([CH2]),$([CH][CX4]),$(C([CX4])[CX4])]=[$([CH2]),$([CH][CX4]),$(C([CX4])[CX4])]",
     "ketene":                                   "C=C=O",
     "methylidene-1,3-dithiole":                 "S1C=CSC1=S",
-    "Michael acceptor_1":                       "C=!@CC=[O,S]",
+#   "Michael acceptor_1":                       "C=!@CC=[O,S]",
     "Michael acceptor_2":                       "[$([CH]),$(CC)]#CC(=O)[C,c]",
     "Michael acceptor_3":                       "[$([CH]),$(CC)]#CS(=O)(=O)[C,c]",
     "Michael acceptor_4":                       "C=C(C=O)C=O",

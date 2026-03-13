@@ -24,10 +24,11 @@ mol_files/0. EnamineSDFs/EnamineBBStock_*.sdf
 # TESTER SDFs (small, tracked)
 !mol_files/0. EnamineSDFs/TESTER_*.sdf
 # Generated/cache files (not tracked)
-mol_files/0. EnamineSDFs/price_cache/
+mol_files/2. Building Blocks/price_cache/
 mol_files/1. Building Blocks/
-mol_files/2. Intermediates/
-mol_files/3. Products/
+mol_files/3. Oxazolones/
+mol_files/4. Imidazolones/
+mol_files/5. Thiazolones/
 *.smi
 *_ACCEPTED_*.csv
 *_REJECTED_*.csv

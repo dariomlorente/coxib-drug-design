@@ -20,7 +20,7 @@ from py_utils._resources import _get_n_workers, _get_ram_budget_gb
 
 
 # Cache directory for persistent storage
-DEFAULT_CACHE_DIR = Path("mol_files/2. Intermediates/.cache")
+DEFAULT_CACHE_DIR = Path("mol_files/3. Oxazolones/.cache")
 
 
 def _get_cache_key(*args) -> str:
@@ -180,7 +180,7 @@ def rxn_ErlenmeyerPlochl(
                         out_rows.append({
                             "ID": f"{ald_id}C{carb_id}",
                             "SMILES": prod_data["smiles"],
-                            "PriceMol_Total": price_total,
+                            "PriceMol": price_total,
                             **{k: v for k, v in prod_data.items() if k != "smiles"},
                         })
                 cache_hits += 1
@@ -246,7 +246,7 @@ def rxn_ErlenmeyerPlochl(
     stats["cache_misses"] = cache_misses
 
     if len(out_df) > 0:
-        out_df = out_df.sort_values(by=["SMILES", "PriceMol_Total"], ascending=[True, True])
+        out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
         out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
 
     if print_report:
@@ -336,7 +336,7 @@ def _process_ep_batch(
                 new_row: dict = {
                     "ID": f"{ald_id}C{carb_id}",
                     "SMILES": psmi,
-                    "PriceMol_Total": price_total,
+                    "PriceMol": price_total,
                     **{k: v for k, v in prod_data.items() if k != "smiles"},
                 }
                 if keep_mol:
@@ -356,16 +356,33 @@ def rxn_AminolysisGFPc(
     smiles_col: str = "SMILES",
     id_col_oxazolone: str = "ID",
     id_col_amine: str = "ID",
-    price_col: str = "PriceMol_Total",
+    price_col: str = "PriceMol",
+    keep_mol: bool = False,
+    print_report: bool = True,
     use_cache: bool = True,
     cache_file: str | Path | None = None,
-    print_report: bool = True,
+    n_workers: int | None = None,
 ) -> pd.DataFrame:
     """
     Aminolysis-GFPc reaction: opens oxazolone rings with amines to form imidazolones.
 
-    Not yet implemented. TODO: Provide reaction SMARTS.
+    Parameters:
+        df_oxazolones: DataFrame with oxazolone compounds.
+        df_amines: DataFrame with primary amine compounds.
+        smiles_col: Column containing SMILES (default: ``"SMILES"``).
+        id_col_oxazolone: ID column in oxazolone DataFrame (default: ``"ID"``).
+        id_col_amine: ID column in amine DataFrame (default: ``"ID"``).
+        price_col: Column with prices (default: ``"PriceMol"``).
+        keep_mol: Keep RDKit mol objects (default: False).
+        print_report: Print statistics (default: True).
+        use_cache: Use persistent cache (default: True).
+        cache_file: Cache file path (default: auto-generated).
+        n_workers: Number of parallel workers (default: cpu_count - 1).
+
+    Returns:
+        DataFrame with imidazolone products.
     """
+    # Validate inputs
     for df, name, id_col in [
         (df_oxazolones, "oxazolones", id_col_oxazolone),
         (df_amines, "amines", id_col_amine),
@@ -377,17 +394,264 @@ def rxn_AminolysisGFPc(
         if price_col not in df.columns:
             raise ValueError(f"Missing '{price_col}' column in {name} DataFrame.")
 
-    raise NotImplementedError(
-        "rxn_AminolysisGFPc is not yet implemented. "
-        "Provide the reaction SMARTS for the aminolysis step to proceed."
+    # Setup cache
+    if cache_file is None:
+        cache_file = DEFAULT_CACHE_DIR / "aminolysis_gfpc_cache.json.gz"
+    else:
+        cache_file = Path(cache_file)
+
+    cache = _load_cache(cache_file) if use_cache else {}
+    cache_hits = 0
+    cache_misses = 0
+    new_cache_entries: dict[str, list] = {}
+
+    # SMARTS patterns for reactants
+    patt_oxazolone = Chem.MolFromSmarts("[O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42]")
+    patt_amine = Chem.MolFromSmarts("[NX3H2:10][*:11]")
+
+    if patt_oxazolone is None:
+        raise ValueError("Failed to build oxazolone pattern from SMARTS.")
+    if patt_amine is None:
+        raise ValueError("Failed to build amine pattern from SMARTS.")
+
+    # Reaction SMARTS: oxazolone + primary amine → imidazolone + water
+    rxn_ag = rdChemReactions.ReactionFromSmarts(
+        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([NX3H2:10][*:11])>>"
+        "([O:51]=[C:5]1[NX3:10]([*:11])[C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([OX2H2:1])"
     )
+
+    if rxn_ag is None:
+        raise ValueError("Failed to build reaction from SMARTS.")
+
+    stats = {
+        "input_oxazolones": len(df_oxazolones),
+        "input_amines": len(df_amines),
+        "invalid_oxazolone": 0,
+        "invalid_amine": 0,
+        "not_oxazolone": 0,
+        "not_amine": 0,
+        "no_product": 0,
+        "problematic": 0,
+        "output_rows": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+    }
+
+    # Pre-process oxazolones
+    valid_oxazolones: list[tuple[str, str, float]] = []  # (smi, id, price)
+    for _, row in df_oxazolones.iterrows():
+        smi = str(row[smiles_col])
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            stats["invalid_oxazolone"] += 1
+        elif mol.HasSubstructMatch(patt_oxazolone):
+            valid_oxazolones.append((smi, str(row[id_col_oxazolone]), float(row[price_col])))
+        else:
+            stats["not_oxazolone"] += 1
+
+    # Pre-process amines
+    valid_amines: list[tuple[str, str, float]] = []  # (smi, id, price)
+    for _, row in df_amines.iterrows():
+        smi = str(row[smiles_col])
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            stats["invalid_amine"] += 1
+        elif mol.HasSubstructMatch(patt_amine):
+            valid_amines.append((smi, str(row[id_col_amine]), float(row[price_col])))
+        else:
+            stats["not_amine"] += 1
+
+    # Cache check
+    out_rows: list[dict] = []
+    work_items: list[tuple[int, int]] = []
+
+    for i, (ox_smi, ox_id, ox_price) in enumerate(valid_oxazolones):
+        for j, (am_smi, am_id, am_price) in enumerate(valid_amines):
+            cache_key = _get_cache_key(ox_smi, am_smi)
+
+            if use_cache and cache_key in cache:
+                cached_result = cache[cache_key]
+                if cached_result:
+                    price_total = ox_price + am_price
+                    for prod_data in cached_result:
+                        out_rows.append({
+                            "ID": f"{ox_id}A{am_id}",
+                            "SMILES": prod_data["smiles"],
+                            "PriceMol": price_total,
+                            **{k: v for k, v in prod_data.items() if k != "smiles"},
+                        })
+                cache_hits += 1
+            else:
+                work_items.append((i, j))
+                cache_misses += 1
+
+    if print_report:
+        total_pairs = len(valid_oxazolones) * len(valid_amines)
+        print(f"[AminolysisGFPc] {total_pairs:,} total pairs: "
+              f"{cache_hits:,} cache hits, {cache_misses:,} misses")
+
+    # Parallel computation
+    if work_items:
+        n_workers = _get_n_workers(n_workers)
+        ox_tuples = [(smi, oid, price) for smi, oid, price in valid_oxazolones]
+        am_tuples = [(smi, aid, price) for smi, aid, price in valid_amines]
+
+        if len(work_items) >= 1000 and n_workers > 1:
+            batch_size = max(1, len(work_items) // (n_workers * 10))
+            batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
+
+            if print_report:
+                print(f"[AminolysisGFPc] Processing {len(work_items):,} "
+                      f"misses with {n_workers} workers ({len(batches)} batches)...")
+
+            worker_fn = partial(
+                _process_ag_batch,
+                ox_data=ox_tuples,
+                am_data=am_tuples,
+                keep_mol=keep_mol,
+            )
+
+            with mp.Pool(processes=n_workers) as pool:
+                results = pool.map(worker_fn, batches)
+
+            for batch_rows, batch_cache, batch_stats in results:
+                out_rows.extend(batch_rows)
+                new_cache_entries.update(batch_cache)
+                stats["no_product"] += batch_stats["no_product"]
+                stats["problematic"] += batch_stats["problematic"]
+        else:
+            if print_report and work_items:
+                print(f"[AminolysisGFPc] Processing {len(work_items):,} "
+                      f"misses in main thread (< 1000)...")
+            batch_rows, batch_cache, batch_stats = _process_ag_batch(
+                work_items, ox_tuples, am_tuples, keep_mol
+            )
+            out_rows.extend(batch_rows)
+            new_cache_entries.update(batch_cache)
+            stats["no_product"] += batch_stats["no_product"]
+            stats["problematic"] += batch_stats["problematic"]
+
+    # Save cache
+    if use_cache and new_cache_entries:
+        cache.update(new_cache_entries)
+        _save_cache(cache_file, cache)
+
+    out_df = pd.DataFrame(out_rows)
+    stats["output_rows"] = len(out_df)
+    stats["cache_hits"] = cache_hits
+    stats["cache_misses"] = cache_misses
+
+    if len(out_df) > 0:
+        out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
+        out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
+
+    if print_report:
+        if use_cache:
+            total_lookups = cache_hits + cache_misses
+            hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0
+            print(f"[AminolysisGFPc] Cache: {cache_hits} hits, "
+                  f"{cache_misses} misses ({hit_rate:.1f}% hit rate)")
+        print(f"[AminolysisGFPc] Stats: {stats}")
+
+    return out_df
+
+
+def _process_ag_batch(
+    work_items: list[tuple[int, int]],
+    ox_data: list[tuple[str, str, float]],
+    am_data: list[tuple[str, str, float]],
+    keep_mol: bool = False,
+) -> tuple[list[dict], dict[str, list], dict[str, int]]:
+    """Worker function for Aminolysis-GFPc parallel computation."""
+    rxn_ag = rdChemReactions.ReactionFromSmarts(
+        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([NX3H2:10][*:11])>>"
+        "([O:51]=[C:5]1[NX3:10]([*:11])[C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([OX2H2:1])"
+    )
+
+    out_rows: list[dict] = []
+    new_cache: dict[str, list] = {}
+    stats = {"no_product": 0, "problematic": 0}
+
+    for ox_idx, am_idx in work_items:
+        ox_smi, ox_id, ox_price = ox_data[ox_idx]
+        am_smi, am_id, am_price = am_data[am_idx]
+        cache_key = _get_cache_key(ox_smi, am_smi)
+
+        ox_mol = Chem.MolFromSmiles(ox_smi)
+        am_mol = Chem.MolFromSmiles(am_smi)
+
+        if ox_mol is None or am_mol is None:
+            new_cache[cache_key] = []
+            stats["problematic"] += 1
+            continue
+
+        try:
+            Chem.SanitizeMol(ox_mol)
+            Chem.SanitizeMol(am_mol)
+            products = rxn_ag.RunReactants((ox_mol, am_mol))
+        except Exception:
+            new_cache[cache_key] = []
+            stats["problematic"] += 1
+            continue
+
+        if not products:
+            new_cache[cache_key] = []
+            stats["no_product"] += 1
+            continue
+
+        price_total = ox_price + am_price
+        seen: set[str] = set()
+        product_data_list: list[dict] = []
+
+        for prod_tuple in products:
+            # prod_tuple contains: (imidazolone_product, water_subproduct)
+            # We want the imidazolone (first element)
+            try:
+                prod_mol = prod_tuple[0]
+                Chem.SanitizeMol(prod_mol)
+                psmi = Chem.MolToSmiles(prod_mol)
+                if psmi in seen:
+                    continue
+                seen.add(psmi)
+
+                prod_data = {
+                    "smiles": psmi,
+                    "MW": Descriptors.MolWt(prod_mol),
+                    "HAcp": Lipinski.NumHAcceptors(prod_mol),
+                    "HDon": Lipinski.NumHDonors(prod_mol),
+                    "RotBnd": Lipinski.NumRotatableBonds(prod_mol),
+                    "HvyAtm": prod_mol.GetNumHeavyAtoms(),
+                    "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
+                    "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                }
+                product_data_list.append(prod_data)
+
+                new_row: dict = {
+                    "ID": f"{ox_id}A{am_id}",
+                    "SMILES": psmi,
+                    "PriceMol": price_total,
+                    **{k: v for k, v in prod_data.items() if k != "smiles"},
+                }
+                if keep_mol:
+                    new_row["Mol"] = prod_mol
+                out_rows.append(new_row)
+            except Exception:
+                stats["problematic"] += 1
+
+        new_cache[cache_key] = product_data_list
+
+    return out_rows, new_cache, stats
 
 
 def rxn_SulphurExchange(
     df_oxazolones: pd.DataFrame,
     smiles_col: str = "SMILES",
     id_col: str = "ID",
-    price_col: str = "PriceMol_Total",
+    price_col: str = "PriceMol",
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     print_report: bool = True,

@@ -48,7 +48,7 @@ _ENAMINE_EMAIL = os.environ.get("ENAMINE_EMAIL", "")
 _ENAMINE_PASSWORD = os.environ.get("ENAMINE_PASSWORD", "")
 
 # Cache directory
-DEFAULT_CACHE_DIR = "mol_files/0. EnamineSDFs/price_cache"
+DEFAULT_CACHE_DIR = "mol_files/2. Building Blocks/price_cache"
 
 
 class EnamineClient:

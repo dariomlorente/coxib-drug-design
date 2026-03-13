@@ -23,7 +23,7 @@ from py_utils._resources import _get_n_workers
 
 
 # Cache directory for persistent storage
-DEFAULT_CACHE_DIR = Path("mol_files/2. Intermediates/.cache")
+DEFAULT_CACHE_DIR = Path("mol_files/3. Oxazolones/.cache")
 
 
 def _get_cache_key(*args) -> str:
@@ -741,10 +741,11 @@ def cleanup_generated_files(base_path: str = ".", verbose: bool = True) -> None:
     import shutil
     
     paths_to_clean = [
-        "mol_files/1. Building Blocks",
-        "mol_files/2. Intermediates",
-        "mol_files/3. Products",
-        "mol_files/0. EnamineSDFs/price_cache",
+        "mol_files/2. Building Blocks",
+        "mol_files/3. Oxazolones",
+        "mol_files/4. Imidazolones",
+        "mol_files/5. Thiazolones",
+        "mol_files/2. Building Blocks/price_cache",
     ]
     
     removed_count = 0
