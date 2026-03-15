@@ -123,7 +123,7 @@ BRENK_ALERTS: dict[str, str] = {
     "Thiobenzothiazole_1":                      "c12ccccc1(SC(S)=N2)",
     "Thiobenzothiazole_2":                      "c12ccccc1(SC(=S)N2)",
     "Thiocarbonyl group":                       "[C,c]=S",
-    "thioester":                                "SC=O",
+#   "thioester":                                "SC=O",
     "thiol_1":                                  "[S-]",
     "thiol_2":                                  "[SH]",
     "Three-membered heterocycle":               "*1[O,S,N]*1",

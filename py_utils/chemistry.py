@@ -649,6 +649,7 @@ def _process_ag_batch(
 
 def rxn_SulphurExchange(
     df_oxazolones: pd.DataFrame,
+    thioacetic_price_eq: float,
     smiles_col: str = "SMILES",
     id_col: str = "ID",
     price_col: str = "PriceMol",
@@ -659,19 +660,263 @@ def rxn_SulphurExchange(
     """
     Sulphur-Exchange reaction: converts oxazolones to thiazolones by replacing oxygen with sulphur.
 
-    Not yet implemented. TODO: Provide reaction SMARTS.
+    Parameters:
+        df_oxazolones: DataFrame with oxazolone compounds.
+        thioacetic_price_eq: Price per equivalent of thioacetic acid reagent.
+        smiles_col: Column containing SMILES (default: ``"SMILES"``).
+        id_col: ID column in oxazolone DataFrame (default: ``"ID"``).
+        price_col: Column with prices (default: ``"PriceMol"``).
+        use_cache: Use persistent cache (default: True).
+        cache_file: Cache file path (default: auto-generated).
+        print_report: Print statistics (default: True).
+
+    Returns:
+        DataFrame with thiazolone products.
     """
+    # Validate inputs
     if smiles_col not in df_oxazolones.columns:
         raise ValueError(f"Missing '{smiles_col}' column in oxazolones DataFrame.")
     if id_col not in df_oxazolones.columns:
         raise ValueError(f"Missing '{id_col}' column in oxazolones DataFrame.")
     if price_col not in df_oxazolones.columns:
         raise ValueError(f"Missing '{price_col}' column in oxazolones DataFrame.")
+    if thioacetic_price_eq < 0:
+        raise ValueError(f"Thioacetic price must be non-negative, got {thioacetic_price_eq}.")
 
-    raise NotImplementedError(
-        "rxn_SulphurExchange is not yet implemented. "
-        "Provide the reaction SMARTS for the sulphur-exchange step to proceed."
+    # Setup cache
+    if cache_file is None:
+        cache_file = DEFAULT_CACHE_DIR / "thiazolone_cache.json.gz"
+    else:
+        cache_file = Path(cache_file)
+
+    cache = _load_cache(cache_file) if use_cache else {}
+    cache_hits = 0
+    cache_misses = 0
+    new_cache_entries: dict[str, list] = {}
+
+    # SMARTS patterns
+    patt_oxazolone = Chem.MolFromSmarts("[O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42]")
+    if patt_oxazolone is None:
+        raise ValueError("Failed to build oxazolone pattern from SMARTS.")
+
+    # Thioacetic acid reagent (fixed SMILES)
+    smiles_thioacetic = "[C:93][C:94](=[O:85])[SX2H:10]"
+    mol_thioacetic = Chem.MolFromSmiles("[C:93][C:94](=[O:85])[SH:10]")
+    if mol_thioacetic is None:
+        raise ValueError("Failed to build thioacetic acid reagent Mol (invalid SMILES).")
+
+    # Reaction SMARTS: oxazolone + thioacetic acid → thiazolone + acetic acid
+    rxn_se = rdChemReactions.ReactionFromSmarts(
+        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([C:93][C:94](=[O:85])[SX2H:10])>>"
+        "([O:51]=[C:5]1[SX2:10][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([C:93][C:94](=[O:85])[OX2H:1])"
     )
+
+    if rxn_se is None:
+        raise ValueError("Failed to build reaction from SMARTS.")
+
+    stats = {
+        "input_oxazolones": len(df_oxazolones),
+        "thioacetic_price_eq": thioacetic_price_eq,
+        "invalid_oxazolone": 0,
+        "not_oxazolone": 0,
+        "no_product": 0,
+        "problematic": 0,
+        "output_rows": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+    }
+
+    # Pre-process oxazolones
+    valid_oxazolones: list[tuple[str, str, float]] = []  # (smi, id, price)
+    for _, row in df_oxazolones.iterrows():
+        smi = str(row[smiles_col])
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            stats["invalid_oxazolone"] += 1
+        elif mol.HasSubstructMatch(patt_oxazolone):
+            valid_oxazolones.append((smi, str(row[id_col]), float(row[price_col])))
+        else:
+            stats["not_oxazolone"] += 1
+
+    # Cache check
+    out_rows: list[dict] = []
+    work_items: list[int] = []
+
+    for i, (ox_smi, ox_id, ox_price) in enumerate(valid_oxazolones):
+        cache_key = _get_cache_key(ox_smi, smiles_thioacetic)
+
+        if use_cache and cache_key in cache:
+            cached_result = cache[cache_key]
+            if cached_result:
+                price_total = ox_price + thioacetic_price_eq
+                for prod_data in cached_result:
+                    out_rows.append({
+                        "ID": f"{ox_id}S",
+                        "SMILES": prod_data["smiles"],
+                        "PriceMol": price_total,
+                        **{k: v for k, v in prod_data.items() if k != "smiles"},
+                    })
+            cache_hits += 1
+        else:
+            work_items.append(i)
+            cache_misses += 1
+
+    if print_report:
+        print(f"[SulphurExchange] {len(valid_oxazolones):,} valid oxazolones: "
+              f"{cache_hits:,} cache hits, {cache_misses:,} misses")
+
+    # Parallel computation
+    if work_items:
+        n_workers = _get_n_workers(None)
+        ox_tuples = [(smi, oid, price) for smi, oid, price in valid_oxazolones]
+
+        if len(work_items) >= 1000 and n_workers > 1:
+            batch_size = max(1, len(work_items) // (n_workers * 10))
+            batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
+
+            if print_report:
+                print(f"[SulphurExchange] Processing {len(work_items):,} "
+                      f"misses with {n_workers} workers ({len(batches)} batches)...")
+
+            worker_fn = partial(
+                _process_se_batch,
+                ox_data=ox_tuples,
+                smiles_thioacetic=smiles_thioacetic,
+                thioacetic_price_eq=thioacetic_price_eq,
+            )
+
+            with mp.Pool(processes=n_workers) as pool:
+                results = pool.map(worker_fn, batches)
+
+            for batch_rows, batch_cache, batch_stats in results:
+                out_rows.extend(batch_rows)
+                new_cache_entries.update(batch_cache)
+                stats["no_product"] += batch_stats["no_product"]
+                stats["problematic"] += batch_stats["problematic"]
+        else:
+            if print_report and work_items:
+                print(f"[SulphurExchange] Processing {len(work_items):,} "
+                      f"misses in main thread (< 1000)...")
+            batch_rows, batch_cache, batch_stats = _process_se_batch(
+                work_items, ox_tuples, smiles_thioacetic, thioacetic_price_eq
+            )
+            out_rows.extend(batch_rows)
+            new_cache_entries.update(batch_cache)
+            stats["no_product"] += batch_stats["no_product"]
+            stats["problematic"] += batch_stats["problematic"]
+
+    # Save cache
+    if use_cache and new_cache_entries:
+        cache.update(new_cache_entries)
+        _save_cache(cache_file, cache)
+
+    out_df = pd.DataFrame(out_rows)
+    stats["output_rows"] = len(out_df)
+    stats["cache_hits"] = cache_hits
+    stats["cache_misses"] = cache_misses
+
+    if len(out_df) > 0:
+        out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
+        out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
+
+    if print_report:
+        if use_cache:
+            total_lookups = cache_hits + cache_misses
+            hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0
+            print(f"[SulphurExchange] Cache: {cache_hits} hits, "
+                  f"{cache_misses} misses ({hit_rate:.1f}% hit rate)")
+        print(f"[SulphurExchange] Stats: {stats}")
+
+    return out_df
+
+
+def _process_se_batch(
+    work_items: list[int],
+    ox_data: list[tuple[str, str, float]],
+    smiles_thioacetic: str,
+    thioacetic_price_eq: float,
+) -> tuple[list[dict], dict[str, list], dict[str, int]]:
+    """Worker function for Sulphur-Exchange parallel computation."""
+    rxn_se = rdChemReactions.ReactionFromSmarts(
+        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([C:93][C:94](=[O:85])[SX2H:10])>>"
+        "([O:51]=[C:5]1[SX2:10][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+        "([C:93][C:94](=[O:85])[OX2H:1])"
+    )
+    mol_thioacetic = Chem.MolFromSmiles("[C:93][C:94](=[O:85])[SH:10]")
+
+    out_rows: list[dict] = []
+    new_cache: dict[str, list] = {}
+    stats = {"no_product": 0, "problematic": 0}
+
+    for ox_idx in work_items:
+        ox_smi, ox_id, ox_price = ox_data[ox_idx]
+        cache_key = _get_cache_key(ox_smi, smiles_thioacetic)
+
+        ox_mol = Chem.MolFromSmiles(ox_smi)
+
+        if ox_mol is None or mol_thioacetic is None:
+            new_cache[cache_key] = []
+            stats["problematic"] += 1
+            continue
+
+        try:
+            Chem.SanitizeMol(ox_mol)
+            Chem.SanitizeMol(mol_thioacetic)
+            products = rxn_se.RunReactants((ox_mol, mol_thioacetic))
+        except Exception:
+            new_cache[cache_key] = []
+            stats["problematic"] += 1
+            continue
+
+        if not products:
+            new_cache[cache_key] = []
+            stats["no_product"] += 1
+            continue
+
+        # Only one product tuple per reaction (1-to-1)
+        seen: set[str] = set()
+        product_data_list: list[dict] = []
+
+        for prod_tuple in products:
+            # Take only first product [0] - thiazolone
+            # Second [1] is acetic acid byproduct
+            try:
+                prod_mol = prod_tuple[0]
+                Chem.SanitizeMol(prod_mol)
+                psmi = Chem.MolToSmiles(prod_mol)
+                if psmi in seen:
+                    continue
+                seen.add(psmi)
+
+                prod_data = {
+                    "smiles": psmi,
+                    "MW": Descriptors.MolWt(prod_mol),
+                    "HAcp": Lipinski.NumHAcceptors(prod_mol),
+                    "HDon": Lipinski.NumHDonors(prod_mol),
+                    "RotBnd": Lipinski.NumRotatableBonds(prod_mol),
+                    "HvyAtm": prod_mol.GetNumHeavyAtoms(),
+                    "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
+                    "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                }
+                product_data_list.append(prod_data)
+
+                # Add to output rows with thioacetic price included
+                new_row: dict = {
+                    "ID": f"{ox_id}S",
+                    "SMILES": psmi,
+                    "PriceMol": ox_price + thioacetic_price_eq,
+                    **{k: v for k, v in prod_data.items() if k != "smiles"},
+                }
+                out_rows.append(new_row)
+            except Exception:
+                stats["problematic"] += 1
+
+        new_cache[cache_key] = product_data_list
+
+    return out_rows, new_cache, stats
 
 
 def _drop_priceg_and_keep_cheapest_smiles(

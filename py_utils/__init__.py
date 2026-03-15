@@ -33,7 +33,7 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-__version__ = "3.13"  # Month.Day - Aminolysis-GFPc reaction implementation
+__version__ = "3.15"  # Month.Day - Sulphur-Exchange reaction implementation
 __author__ = "Dario M Lorente"
 
 __all__ = [

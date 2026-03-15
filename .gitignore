@@ -20,12 +20,12 @@ venv/
 # Generated data files (pipeline outputs)
 # Source SDFs from Enamine
 # Full Enamine SDFs (too large for GitHub)
-mol_files/0. EnamineSDFs/EnamineBBStock_*.sdf
+mol_files/1. Enamine SDFs/EnamineBBStock_*.sdf
 # TESTER SDFs (small, tracked)
-!mol_files/0. EnamineSDFs/TESTER_*.sdf
+!mol_files/1. Enamine SDFs/TESTER_*.sdf
 # Generated/cache files (not tracked)
 mol_files/2. Building Blocks/price_cache/
-mol_files/1. Building Blocks/
+mol_files/2. Building Blocks/
 mol_files/3. Oxazolones/
 mol_files/4. Imidazolones/
 mol_files/5. Thiazolones/
