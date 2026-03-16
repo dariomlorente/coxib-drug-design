@@ -480,21 +480,35 @@ def add_enamine_prices(
     final_invalid_cache = invalid_cache.copy()
     final_invalid_cache.update({cid: True for cid in new_invalid_compounds})
 
-    mols = out_df[smiles_col].apply(Chem.MolFromSmiles)
-    mws = mols.apply(lambda m: Descriptors.MolWt(m) if m else None)
-
+    # Build price map only for compounds that have valid pricing.
+    # Create a lookup from compound ID to SMILES (avoids parsing ALL rows).
     valid_ids = set(compound_ids) & set(final_valid_cache.keys())
-    price_map = {
-        cid: (final_valid_cache[cid]["price_per_gram"], 
-              final_valid_cache[cid]["price_per_gram"] * mws.iloc[i])
-        for i, cid in enumerate(compound_ids)
-        if cid in valid_ids
-        and final_valid_cache[cid]["price_per_gram"] <= max_price_per_gram
-        and final_valid_cache[cid]["price"] <= max_pack_price
-    }
+    id_to_smi: dict[str, str] = dict(
+        zip(out_df[id_col].astype(str), out_df[smiles_col].astype(str))
+    )
+    price_map: dict[str, tuple[float, float]] = {}
+    for cid in valid_ids:
+        pack = final_valid_cache[cid]
+        ppg = pack["price_per_gram"]
+        if ppg > max_price_per_gram or pack["price"] > max_pack_price:
+            continue
+        smi = id_to_smi.get(cid)
+        if smi is None:
+            continue
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        mw = Descriptors.MolWt(mol)
+        price_map[cid] = (ppg, ppg * mw)
 
-    out_df["PriceG"] = out_df[id_col].map(lambda x: price_map.get(x, (None, None))[0])
-    out_df["PriceMol"] = out_df[id_col].map(lambda x: price_map.get(x, (None, None))[1])
+    priceg_series = out_df[id_col].map(price_map).apply(
+        lambda v: v[0] if isinstance(v, tuple) else None
+    )
+    pricemol_series = out_df[id_col].map(price_map).apply(
+        lambda v: v[1] if isinstance(v, tuple) else None
+    )
+    out_df["PriceG"] = priceg_series
+    out_df["PriceMol"] = pricemol_series
     
     if use_cache and (new_valid_prices or new_invalid_compounds):
         cache_to_save = {

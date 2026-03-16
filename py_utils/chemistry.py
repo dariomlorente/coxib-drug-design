@@ -11,7 +11,6 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors, rdChemReactions
@@ -196,8 +195,6 @@ def rxn_ErlenmeyerPlochl(
     # Parallel computation
     if work_items:
         n_workers = _get_n_workers(n_workers)
-        ald_tuples = [(smi, aid, price) for smi, aid, price in valid_aldehydes]
-        carb_tuples = [(smi, nid, price) for smi, nid, price in valid_carboxylics]
 
         if len(work_items) >= 1000 and n_workers > 1:
             batch_size = max(1, len(work_items) // (n_workers * 10))
@@ -209,8 +206,8 @@ def rxn_ErlenmeyerPlochl(
 
             worker_fn = partial(
                 _process_ep_batch,
-                ald_data=ald_tuples,
-                carb_data=carb_tuples,
+                ald_data=valid_aldehydes,
+                carb_data=valid_carboxylics,
                 smiles_gly=smiles_gly,
                 keep_mol=keep_mol,
             )
@@ -228,7 +225,7 @@ def rxn_ErlenmeyerPlochl(
                 print(f"[ErlenmeyerPlochl] Processing {len(work_items):,} "
                       f"misses in main thread (< 1000)...")
             batch_rows, batch_cache, batch_stats = _process_ep_batch(
-                work_items, ald_tuples, carb_tuples, smiles_gly, keep_mol
+                work_items, valid_aldehydes, valid_carboxylics, smiles_gly, keep_mol
             )
             out_rows.extend(batch_rows)
             new_cache_entries.update(batch_cache)
@@ -294,9 +291,6 @@ def _process_ep_batch(
             continue
 
         try:
-            Chem.SanitizeMol(ald_mol)
-            Chem.SanitizeMol(carb_mol)
-            Chem.SanitizeMol(mol_gly)
             products = rxn_ep.RunReactants((ald_mol, carb_mol, mol_gly))
         except Exception:
             new_cache[cache_key] = []
@@ -324,9 +318,9 @@ def _process_ep_batch(
                 prod_data = {
                     "smiles": psmi,
                     "MW": Descriptors.MolWt(prod_mol),
-                    "HAcp": Lipinski.NumHAcceptors(prod_mol),
-                    "HDon": Lipinski.NumHDonors(prod_mol),
-                    "RotBnd": Lipinski.NumRotatableBonds(prod_mol),
+                    "HBA": Lipinski.NumHAcceptors(prod_mol),
+                    "HBD": Lipinski.NumHDonors(prod_mol),
+                    "RotB": Lipinski.NumRotatableBonds(prod_mol),
                     "HvyAtm": prod_mol.GetNumHeavyAtoms(),
                     "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
                     "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
@@ -495,8 +489,6 @@ def rxn_AminolysisGFPc(
     # Parallel computation
     if work_items:
         n_workers = _get_n_workers(n_workers)
-        ox_tuples = [(smi, oid, price) for smi, oid, price in valid_oxazolones]
-        am_tuples = [(smi, aid, price) for smi, aid, price in valid_amines]
 
         if len(work_items) >= 1000 and n_workers > 1:
             batch_size = max(1, len(work_items) // (n_workers * 10))
@@ -508,8 +500,8 @@ def rxn_AminolysisGFPc(
 
             worker_fn = partial(
                 _process_ag_batch,
-                ox_data=ox_tuples,
-                am_data=am_tuples,
+                ox_data=valid_oxazolones,
+                am_data=valid_amines,
                 keep_mol=keep_mol,
             )
 
@@ -526,7 +518,7 @@ def rxn_AminolysisGFPc(
                 print(f"[AminolysisGFPc] Processing {len(work_items):,} "
                       f"misses in main thread (< 1000)...")
             batch_rows, batch_cache, batch_stats = _process_ag_batch(
-                work_items, ox_tuples, am_tuples, keep_mol
+                work_items, valid_oxazolones, valid_amines, keep_mol
             )
             out_rows.extend(batch_rows)
             new_cache_entries.update(batch_cache)
@@ -590,8 +582,6 @@ def _process_ag_batch(
             continue
 
         try:
-            Chem.SanitizeMol(ox_mol)
-            Chem.SanitizeMol(am_mol)
             products = rxn_ag.RunReactants((ox_mol, am_mol))
         except Exception:
             new_cache[cache_key] = []
@@ -621,9 +611,9 @@ def _process_ag_batch(
                 prod_data = {
                     "smiles": psmi,
                     "MW": Descriptors.MolWt(prod_mol),
-                    "HAcp": Lipinski.NumHAcceptors(prod_mol),
-                    "HDon": Lipinski.NumHDonors(prod_mol),
-                    "RotBnd": Lipinski.NumRotatableBonds(prod_mol),
+                    "HBA": Lipinski.NumHAcceptors(prod_mol),
+                    "HBD": Lipinski.NumHDonors(prod_mol),
+                    "RotB": Lipinski.NumRotatableBonds(prod_mol),
                     "HvyAtm": prod_mol.GetNumHeavyAtoms(),
                     "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
                     "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
@@ -770,7 +760,6 @@ def rxn_SulphurExchange(
     # Parallel computation
     if work_items:
         n_workers = _get_n_workers(None)
-        ox_tuples = [(smi, oid, price) for smi, oid, price in valid_oxazolones]
 
         if len(work_items) >= 1000 and n_workers > 1:
             batch_size = max(1, len(work_items) // (n_workers * 10))
@@ -782,7 +771,7 @@ def rxn_SulphurExchange(
 
             worker_fn = partial(
                 _process_se_batch,
-                ox_data=ox_tuples,
+                ox_data=valid_oxazolones,
                 smiles_thioacetic=smiles_thioacetic,
                 thioacetic_price_eq=thioacetic_price_eq,
             )
@@ -800,7 +789,7 @@ def rxn_SulphurExchange(
                 print(f"[SulphurExchange] Processing {len(work_items):,} "
                       f"misses in main thread (< 1000)...")
             batch_rows, batch_cache, batch_stats = _process_se_batch(
-                work_items, ox_tuples, smiles_thioacetic, thioacetic_price_eq
+                work_items, valid_oxazolones, smiles_thioacetic, thioacetic_price_eq
             )
             out_rows.extend(batch_rows)
             new_cache_entries.update(batch_cache)
@@ -863,8 +852,6 @@ def _process_se_batch(
             continue
 
         try:
-            Chem.SanitizeMol(ox_mol)
-            Chem.SanitizeMol(mol_thioacetic)
             products = rxn_se.RunReactants((ox_mol, mol_thioacetic))
         except Exception:
             new_cache[cache_key] = []
@@ -894,9 +881,9 @@ def _process_se_batch(
                 prod_data = {
                     "smiles": psmi,
                     "MW": Descriptors.MolWt(prod_mol),
-                    "HAcp": Lipinski.NumHAcceptors(prod_mol),
-                    "HDon": Lipinski.NumHDonors(prod_mol),
-                    "RotBnd": Lipinski.NumRotatableBonds(prod_mol),
+                    "HBA": Lipinski.NumHAcceptors(prod_mol),
+                    "HBD": Lipinski.NumHDonors(prod_mol),
+                    "RotB": Lipinski.NumRotatableBonds(prod_mol),
                     "HvyAtm": prod_mol.GetNumHeavyAtoms(),
                     "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
                     "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
@@ -918,28 +905,3 @@ def _process_se_batch(
 
     return out_rows, new_cache, stats
 
-
-def _drop_priceg_and_keep_cheapest_smiles(
-    df: pd.DataFrame,
-    smiles_col: str = "SMILES",
-    price_col: str = "PriceMol",
-    priceg_col: str = "PriceG",
-    print_report: bool = True,
-) -> pd.DataFrame:
-    """Drops PriceG column and removes duplicate SMILES keeping cheapest."""
-    out = df.copy()
-
-    if priceg_col in out.columns:
-        out = out.drop(columns=[priceg_col])
-
-    out[price_col] = pd.to_numeric(out[price_col], errors="coerce")
-    out = out.sort_values(by=[smiles_col, price_col], ascending=[True, True], na_position="last")
-
-    duplicated_mask = out.duplicated(subset=[smiles_col], keep="first")
-    removed = out.loc[duplicated_mask, [smiles_col, price_col]]
-    out = out.loc[~duplicated_mask].reset_index(drop=True)
-
-    if print_report and len(removed) > 0:
-        print(f"⚠️ Removed {len(removed)} duplicated SMILES (kept lowest PriceMol).")
-
-    return out

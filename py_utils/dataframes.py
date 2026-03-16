@@ -55,28 +55,6 @@ def _save_cache(cache_file: Path, cache: dict[str, Any]) -> None:
         print(f"⚠️  Error saving cache: {e}")
 
 
-def read_smiles_csv(csv_path: str, id_prefix: str) -> pd.DataFrame:
-    """
-    Read a CSV file containing a 'SMILES' column and return a DataFrame.
-    """
-    if not re.fullmatch(r"[A-Za-z]+", id_prefix):
-        raise ValueError("id_prefix must contain only letters (e.g. 'A', 'C', 'ALD').")
-
-    df = pd.read_csv(csv_path)
-
-    if "SMILES" not in df.columns:
-        raise ValueError("Input CSV must contain a 'SMILES' column.")
-
-    df["SMILES"] = df["SMILES"].astype(str).str.strip()
-    df = df[df["SMILES"].notna() & (df["SMILES"] != "")]
-    df = df.reset_index(drop=True)
-
-    if "ID" not in df.columns:
-        df.insert(0, "ID", [f"{id_prefix}{i+1}" for i in range(len(df))])
-
-    return df
-
-
 def sdf_to_dataframe(sdf_path: str, id_prefix: str, id_prop: str = "Catalog_ID") -> pd.DataFrame:
     """
     Read an SDF file and return a DataFrame with ID and SMILES columns.
@@ -135,50 +113,7 @@ def report_df_size(df: pd.DataFrame, label: str = "") -> None:
     print(f"{prefix}{len(df)} rows")
 
 
-def replace_price_3g_eur(
-    df: pd.DataFrame,
-    max_price: float = 100,
-    smiles_col: str = "SMILES",
-    price_col: str = "PRICE_3G_EUR",
-) -> pd.DataFrame:
-    """
-    Replace column PRICE_3G_EUR with PriceG and PriceMol.
-    Also drops rows with PriceG > max_price.
-    """
-    if price_col not in df.columns:
-        raise ValueError(f"DataFrame is missing required column: {price_col}")
-    if smiles_col not in df.columns:
-        raise ValueError(f"DataFrame is missing required column: {smiles_col}")
-    if max_price <= 0:
-        raise ValueError("max_price must be > 0")
 
-    out_df = df.copy()
-    out_df[price_col] = pd.to_numeric(out_df[price_col], errors="coerce")
-    out_df["PriceG"] = out_df[price_col] / 3.0
-
-    def _mw_from_smiles(smi: Any) -> float:
-        mol = Chem.MolFromSmiles(str(smi).strip())
-        if mol is None:
-            return float("nan")
-        return float(Descriptors.MolWt(mol))
-
-    mw = out_df[smiles_col].map(_mw_from_smiles)
-    out_df["PriceMol"] = out_df["PriceG"] / mw
-    out_df = out_df.drop(columns=[price_col])
-    
-    # Filter: keep only rows with valid, positive prices within limit
-    # PriceG must be > 0 (not NaN, not 0, not negative) and <= max_price
-    valid_prices = (
-        out_df["PriceG"].notna() & 
-        (out_df["PriceG"] > 0) & 
-        (out_df["PriceG"] <= max_price)
-    )
-    removed_count = len(out_df) - valid_prices.sum()
-    if removed_count > 0:
-        print(f"⚠️  Removed {removed_count} compounds with invalid prices (<= 0 or > {max_price})")
-    out_df = out_df[valid_prices].reset_index(drop=True)
-
-    return out_df
 
 
 def save_dataframe_as_csv(df: pd.DataFrame, output_base_path: str) -> None:
@@ -192,74 +127,94 @@ def save_dataframe_as_csv(df: pd.DataFrame, output_base_path: str) -> None:
     print(f"Saved {n_rows} compounds to: {output_path}")
 
 
-def save_dataframe_as_sdf(df: pd.DataFrame, output_path: str, smiles_col: str = "SMILES", id_col: str = "ID") -> None:
-    """Save a DataFrame to SDF file with 2D structures."""
-    directory = os.path.dirname(output_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-    writer = SDWriter(output_path)
-    n_written = 0
-
-    for _, row in df.iterrows():
-        smi = str(row.get(smiles_col, ""))
-        mol_id = str(row.get(id_col, f"mol_{n_written}"))
+def _process_descriptors_batch(
+    batch_items: list[tuple[int, str]],
+) -> list[tuple[int, dict]]:
+    """Worker function for parallel descriptor calculation."""
+    results = []
+    for idx, smi in batch_items:
         mol = Chem.MolFromSmiles(smi)
-        if mol is not None:
-            mol.SetProp("_Name", mol_id)
-            for col in df.columns:
-                if col not in [smiles_col, id_col, "Mol"]:
-                    value = row.get(col)
-                    if pd.notna(value):
-                        mol.SetProp(str(col), str(value))
-            writer.write(mol)
-            n_written += 1
-
-    writer.close()
-    print(f"Saved {n_written} molecules to: {output_path}")
-
-
-def save_dataframe_as_smi(df: pd.DataFrame, output_path: str, smiles_col: str = "SMILES") -> None:
-    """Save SMILES column from DataFrame to .smi file."""
-    directory = os.path.dirname(output_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-
-    n_written = 0
-    with open(output_path, 'w') as f:
-        for _, row in df.iterrows():
-            smi = str(row.get(smiles_col, ""))
-            if smi and smi != "nan":
-                f.write(smi + "\n")
-                n_written += 1
-
-    print(f"Saved {n_written} SMILES to: {output_path}")
+        if mol is None:
+            continue
+        try:
+            Chem.SanitizeMol(mol)
+            desc = {
+                "MW": Descriptors.MolWt(mol),
+                "HBD": Lipinski.NumHDonors(mol),
+                "HBA": Lipinski.NumHAcceptors(mol),
+                "RotB": Lipinski.NumRotatableBonds(mol),
+                "HvyAtm": mol.GetNumHeavyAtoms(),
+                "Rings": rdMolDescriptors.CalcNumRings(mol),
+                "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(mol),
+                "MR": Descriptors.MolMR(mol),
+                "CAtm": sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6),
+            }
+            results.append((idx, desc))
+        except Exception:
+            pass
+    return results
 
 
-def add_rdkit_properties(df: pd.DataFrame) -> pd.DataFrame:
-    """Add RDKit descriptors (MW, HAcp, HDon, RotBnd, HvyAtm, Rings, HetAtm) to DataFrame."""
+def add_rdkit_properties(
+    df: pd.DataFrame,
+    n_workers: int | None = None,
+) -> pd.DataFrame:
+    """Add RDKit descriptors (MW, HBD, HBA, RotB, HvyAtm, Rings, CAtm, HetAtm, MR) to DataFrame.
+    
+    Parameters:
+        df: Input DataFrame with SMILES column
+        n_workers: Number of parallel workers (default: cpu_count - 1)
+    
+    Returns:
+        DataFrame with added descriptor columns
+    """
     if "SMILES" not in df.columns:
         raise ValueError("Input DataFrame must contain a 'SMILES' column.")
 
     out = df.copy()
-    mols = out["SMILES"].astype(str).map(Chem.MolFromSmiles)
-    invalid_mask = mols.isna()
-
-    if invalid_mask.any():
-        removed = out.loc[invalid_mask, ["ID", "SMILES"]]
+    
+    # Create list of (index, smiles) tuples for valid molecules
+    valid_items: list[tuple[int, str]] = []
+    invalid_indices: list[int] = []
+    
+    for idx, smi in enumerate(out["SMILES"].astype(str)):
+        if smi and smi != "nan":
+            valid_items.append((idx, smi))
+        else:
+            invalid_indices.append(idx)
+    
+    if invalid_indices:
+        removed = out.loc[invalid_indices, ["ID", "SMILES"]]
         print(f"⚠️  Removed {len(removed)} invalid SMILES rows")
-
-    out = out.loc[~invalid_mask].reset_index(drop=True)
-    mols = mols.loc[~invalid_mask]
-
-    out["MW"] = [Descriptors.MolWt(m) for m in mols]
-    out["HAcp"] = [Lipinski.NumHAcceptors(m) for m in mols]
-    out["HDon"] = [Lipinski.NumHDonors(m) for m in mols]
-    out["RotBnd"] = [Lipinski.NumRotatableBonds(m) for m in mols]
-    out["HvyAtm"] = [m.GetNumHeavyAtoms() for m in mols]
-    out["Rings"] = [rdMolDescriptors.CalcNumRings(m) for m in mols]
-    out["HetAtm"] = [rdMolDescriptors.CalcNumHeteroatoms(m) for m in mols]
-
+    
+    out = out.loc[~out.index.isin(invalid_indices)].reset_index(drop=True)
+    
+    # Prepare batches for multiprocessing
+    n_workers = _get_n_workers(n_workers)
+    batch_size = max(1, len(valid_items) // (n_workers * 10)) if len(valid_items) >= 1000 and n_workers > 1 else len(valid_items)
+    batches = [
+        valid_items[i:i + batch_size]
+        for i in range(0, len(valid_items), batch_size)
+    ]
+    
+    # Process in parallel or sequentially
+    if len(valid_items) >= 1000 and n_workers > 1:
+        with mp.Pool(processes=n_workers) as pool:
+            all_results = pool.map(_process_descriptors_batch, batches)
+        
+        # Flatten results
+        results: list[tuple[int, dict]] = []
+        for batch_result in all_results:
+            results.extend(batch_result)
+    else:
+        results = _process_descriptors_batch(valid_items)
+    
+    # Add descriptors to DataFrame
+    results_dict = {idx: desc for idx, desc in results}
+    
+    for col in ["MW", "HBD", "HBA", "RotB", "HvyAtm", "Rings", "HetAtm", "MR", "CAtm"]:
+        out[col] = [results_dict.get(idx, {}).get(col, None) for idx in range(len(out))]
+    
     return out
 
 
@@ -351,18 +306,18 @@ def filter_Veber(
         reasons = []
         if max_tPSA is not None and row.get("tPSA", 0) > max_tPSA:
             reasons.append(f"tPSA={row['tPSA']:.1f}>{max_tPSA}")
-        if max_RotB is not None and row.get("RotBnd", 0) > max_RotB:
-            reasons.append(f"RotB={row['RotBnd']}>{max_RotB}")
+        if max_RotB is not None and row.get("RotB", 0) > max_RotB:
+            reasons.append(f"RotB={row['RotB']}>{max_RotB}")
         if max_LogP is not None and row.get("LogP", 0) > max_LogP:
             reasons.append(f"LogP={row['LogP']:.2f}>{max_LogP}")
         if min_tPSA is not None and row.get("tPSA", 0) < min_tPSA:
             reasons.append(f"tPSA={row['tPSA']:.1f}<{min_tPSA}")
         if max_MWT is not None and row.get("MW", 0) > max_MWT:
             reasons.append(f"MW={row['MW']:.1f}>{max_MWT}")
-        if max_HBD is not None and row.get("HDon", 0) > max_HBD:
-            reasons.append(f"HBD={row['HDon']}>{max_HBD}")
-        if max_HBA is not None and row.get("HAcp", 0) > max_HBA:
-            reasons.append(f"HBA={row['HAcp']}>{max_HBA}")
+        if max_HBD is not None and row.get("HBD", 0) > max_HBD:
+            reasons.append(f"HBD={row['HBD']}>{max_HBD}")
+        if max_HBA is not None and row.get("HBA", 0) > max_HBA:
+            reasons.append(f"HBA={row['HBA']}>{max_HBA}")
         if min_MR is not None and row.get("MR", 0) < min_MR:
             reasons.append(f"MR={row['MR']:.2f}<{min_MR}")
         if max_MR is not None and row.get("MR", 0) > max_MR:
@@ -399,212 +354,7 @@ def filter_Veber(
     return df_accepted, df_rejected
 
 
-def filter_by_properties(
-    df: pd.DataFrame,
-    max_MW: float | None = None,
-    max_HA: int | None = None,
-    max_HD: int | None = None,
-    max_RotB: int | None = None,
-    max_HeavyAtoms: int | None = None,
-    max_Rings: int | None = None,
-    max_Heteroatoms: int | None = None,
-    smiles_col: str = "SMILES",
-    id_col: str = "ID",
-    print_report: bool = True,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Filter DataFrame by molecular properties (Lipinski/Veber criteria)."""
-    df_work = df.copy()
-    rejection_reasons = []
 
-    for _, row in df_work.iterrows():
-        reasons = []
-        if max_MW is not None and row.get("MW", 0) > max_MW:
-            reasons.append(f"MW={row['MW']:.1f}>{max_MW}")
-        if max_HA is not None and row.get("HAcp", 0) > max_HA:
-            reasons.append(f"HA={row['HAcp']}>{max_HA}")
-        if max_HD is not None and row.get("HDon", 0) > max_HD:
-            reasons.append(f"HD={row['HDon']}>{max_HD}")
-        if max_RotB is not None and row.get("RotBnd", 0) > max_RotB:
-            reasons.append(f"RotB={row['RotBnd']}>{max_RotB}")
-        if max_HeavyAtoms is not None and row.get("HvyAtm", 0) > max_HeavyAtoms:
-            reasons.append(f"HvyAtm={row['HvyAtm']}>{max_HeavyAtoms}")
-        if max_Rings is not None and row.get("Rings", 0) > max_Rings:
-            reasons.append(f"Rings={row['Rings']}>{max_Rings}")
-        if max_Heteroatoms is not None and row.get("HetAtm", 0) > max_Heteroatoms:
-            reasons.append(f"HetAtm={row['HetAtm']}>{max_Heteroatoms}")
-        rejection_reasons.append("; ".join(reasons) if reasons else "")
-
-    df_work["Rejection_Reasons"] = rejection_reasons
-    mask_rejected = df_work["Rejection_Reasons"] != ""
-    df_rejected = df_work[mask_rejected].copy().reset_index(drop=True)
-    df_accepted = df_work[~mask_rejected].copy().reset_index(drop=True)
-
-    if "Rejection_Reasons" in df_accepted.columns:
-        df_accepted = df_accepted.drop(columns=["Rejection_Reasons"])
-
-    if print_report:
-        n_total = len(df)
-        n_accepted = len(df_accepted)
-        n_rejected = len(df_rejected)
-        pct = (n_accepted / n_total * 100) if n_total > 0 else 0
-        print(f"[Filter] {n_accepted}/{n_total} accepted ({pct:.1f}%), {n_rejected} rejected")
-
-    return df_accepted, df_rejected
-
-
-def add_dicarboxylic_flag(
-    df: pd.DataFrame,
-    smiles_col: str = "SMILES",
-    out_col: str = "Dicarb",
-) -> pd.DataFrame:
-    """Add boolean column indicating whether compound has exactly two carboxyl groups."""
-    smarts = "[CX3](=O)[OX1H0-,OX2H1,Cl,Br,I]"
-    patt = Chem.MolFromSmarts(smarts)
-    if patt is None:
-        raise ValueError("Invalid SMARTS pattern for carboxyl group.")
-
-    out_df = df.copy()
-
-    def _has_two_carboxyls(smi: str) -> bool:
-        mol = Chem.MolFromSmiles(str(smi).strip())
-        if mol is None:
-            return False
-        matches = mol.GetSubstructMatches(patt)
-        return len(matches) == 2
-
-    out_df[out_col] = out_df[smiles_col].map(_has_two_carboxyls)
-    return out_df
-
-
-def _process_digest_batch(
-    items: list[tuple[int, str, str]],
-    *,
-    unstable_groups: list[tuple[str, int, str]],
-    max_halflife: float,
-) -> tuple[dict[int, dict], dict[str, dict]]:
-    """
-    Worker function for parallel digest processing.
-
-    Checks each molecule for unstable functional groups by matching
-    SMARTS patterns.  Designed for ``multiprocessing.Pool.map`` via
-    ``functools.partial``.
-
-    Parameters:
-        items: Batch of ``(pos_idx, smiles, cache_key)`` tuples
-            (only cache misses).
-        unstable_groups: List of ``(group_name, halflife_secs, smarts)``
-            tuples defining the labile functional groups.
-        max_halflife: Maximum half-life threshold in seconds.
-
-    Returns:
-        Tuple of ``(results, new_cache)`` where *results* maps
-        positional indices to result dicts and *new_cache* maps cache
-        keys to the same result dicts for persistence.
-    """
-    # Compile SMARTS patterns inside the worker (RDKit pattern objects
-    # are not pickle-safe, so they cannot be sent from the main process).
-    compiled_patterns: list[tuple[str, int, Chem.rdchem.Mol | None]] = []
-    for group_name, halflife, smarts in unstable_groups:
-        if halflife < max_halflife:
-            patt = Chem.MolFromSmarts(smarts)
-            compiled_patterns.append((group_name, halflife, patt))
-
-    results: dict[int, dict] = {}
-    new_cache: dict[str, dict] = {}
-
-    for pos_idx, smi, cache_key in items:
-        mol = Chem.MolFromSmiles(smi)
-        found_groups: list[str] = []
-        min_halflife = float("inf")
-
-        if mol is not None:
-            try:
-                for group_name, halflife, patt in compiled_patterns:
-                    if patt is not None and mol.HasSubstructMatch(patt):
-                        found_groups.append(f"{group_name}({halflife}s)")
-                        min_halflife = min(min_halflife, halflife)
-            except Exception:
-                pass  # Malformed molecule — treat as stable
-
-        if found_groups:
-            result = {
-                "Unstable_Groups": "; ".join(found_groups),
-                "Min_HalfLife_Secs": (
-                    min_halflife if min_halflife != float("inf") else None
-                ),
-            }
-        else:
-            result = {"Unstable_Groups": "", "Min_HalfLife_Secs": None}
-
-        results[pos_idx] = result
-        new_cache[cache_key] = result
-
-    return results, new_cache
-
-
-def digest(
-    df: pd.DataFrame,
-    max_halflife: float = 7200,
-    smiles_col: str = "SMILES",
-    id_col: str = "ID",
-    print_report: bool = True,
-    use_cache: bool = True,
-    cache_file: str | Path | None = None,
-    n_workers: int | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Filter out compounds with toxic or labile functional groups.
-
-    Groups are metabolized by glutathione, blood pH, or body homeostasis.
-    Now with multiprocessing: the main thread checks the persistent cache
-    (serial, fast) and only sends cache misses to parallel workers.
-
-    Parameters:
-        df: DataFrame with SMILES column.
-        max_halflife: Maximum half-life threshold in seconds
-            (default: 7200 = 2 hours).
-        smiles_col: Column containing SMILES strings (default: ``"SMILES"``).
-        id_col: Column for IDs (default: ``"ID"``).
-        print_report: Print summary statistics (default: True).
-        use_cache: Use persistent cache (default: True).
-        cache_file: Cache file path (default: auto-generated based on
-            *max_halflife*).
-        n_workers: Number of parallel workers (default: cpu_count - 1).
-
-    Returns:
-        Tuple of (stable DataFrame, unstable DataFrame).
-    """
-    if smiles_col not in df.columns:
-        raise ValueError(f"Missing column: {smiles_col}")
-
-    # Setup cache
-    if cache_file is None:
-        cache_file = DEFAULT_CACHE_DIR / f"digest_cache_{int(max_halflife)}s.json.gz"
-    else:
-        cache_file = Path(cache_file)
-
-    cache = _load_cache(cache_file) if use_cache else {}
-    cache_hits = 0
-    cache_misses = 0
-
-    unstable_groups = [
-        ("Organic peroxide", 1, "[*:1][OX2][OX2][*:2]"),
-        ("Acyl halide", 2, "[CX3:1](=[O:2])[Cl,Br,I]"),
-        ("Isocyanate", 5, "[*:1][NX2:2]=[CX2]=[OX1]"),
-        ("Carboxylic anhydride", 10, "[CX3:1](=[OX1:11])[OX2:3][CX3:2](=[OX1:22])"),
-        ("Hemiaminal", 30, "[*:11][NX3:1]([*:22])[CX4:2]([*:21])([#6:22])[OX2H:3]"),
-        ("Aldehyde", 60, "[O:1]=[CX3H:2][#6:3]"),
-        ("Azo compound", 90, "[CX4:1][NX2:2]=[NX2:3][CX4:4]"),
-        ("Isocyanide", 180, "[#6:1][NX2H0:2]~[CX1&H0,CX2&H1:3]"),
-        ("Aliphatic azide", 300, "[#6:1][NX2]~[NX2]~[NX1]"),
-        ("Epoxide", 600, "[*:12][C@@X4:1]1([*:11])[OX2:3][C@@X4:2]1([*:21])[*:22]"),
-        ("Aziridine", 1200, "[*:12][C@@X4:1]1([*:11])[NX3H:3][C@@X4:2]1([*:21])[*:22]"),
-        ("Hydrazine", 1500, "[*:1][NX3:2]([*:3])[NX3:4]([*:5])[*:6]"),
-        ("Thiol", 1800, "[cX3,CX4:1][SX2H:2]"),
-        ("Thioester", 3600, "[CX3:1](=[OX1:2])[SX2:3][cX3,CX4:4]"),
-        ("Thiosulfonate", 4800, "[SX4:1](=[OX1:2])(=[OX1:22])[SX2:3][cX3,CX4:4]"),
-        ("Ester", 7200, "[CX3:1](=[OX1:2])[OX2:3][#6:4]"),
-    ]
 
     df_work = df.copy()
     new_cache_entries: dict[str, dict] = {}
@@ -727,62 +477,62 @@ def digest(
     return df_stable, df_unstable
 
 
-def cleanup_generated_files(base_path: str = ".", verbose: bool = True) -> None:
+def _process_brenk_pains_batch(
+    batch_items: list[tuple[int, str, bool]],
+    n_workers: int = 1,
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+    """Worker function for parallel Brenk and PAINS filtering.
+    
+    batch_items: list of (index, smiles, process_pains) tuples
     """
-    Remove all generated files that are not tracked by git.
+    from py_utils._smarts_catalog import BRENK_ALERTS, PAINS_ALERTS
     
-    Cleans CSV files, JSON cache files, Python cache directories,
-    and Jupyter checkpoints from gitignored directories.
+    # Compile patterns inside worker (not pickleable in main process)
+    compiled_brenk: list[tuple[str, Chem.Mol | None]] = []
+    for alert_name, smarts in BRENK_ALERTS.items():
+        patt = Chem.MolFromSmarts(smarts)
+        compiled_brenk.append((alert_name, patt))
     
-    Parameters:
-        base_path: Base directory path (default: current directory)
-        verbose: Print cleanup progress (default: True)
-    """
-    import shutil
+    compiled_pains: list[tuple[str, str, Chem.Mol | None]] = []
+    for pains_class, smarts_dict in PAINS_ALERTS.items():
+        for filter_name, smarts in smarts_dict.items():
+            patt = Chem.MolFromSmarts(smarts)
+            compiled_pains.append((pains_class, filter_name, patt))
     
-    paths_to_clean = [
-        "mol_files/2. Building Blocks",
-        "mol_files/3. Oxazolones",
-        "mol_files/4. Imidazolones",
-        "mol_files/5. Thiazolones",
-        "mol_files/2. Building Blocks/price_cache",
-    ]
+    brenk_results: dict[int, tuple[str, str]] = {}
+    pains_results: dict[int, tuple[str, str]] = {}
     
-    removed_count = 0
+    for idx, smi, process_pains in batch_items:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            brenk_results[idx] = ("invalid_smiles", "")
+            pains_results[idx] = ("invalid_smiles", "")
+            continue
+        
+        # Brenk filtering
+        matched_brenk = False
+        for alert_name, patt in compiled_brenk:
+            if patt and mol.HasSubstructMatch(patt):
+                brenk_results[idx] = ("Brenk", alert_name)
+                matched_brenk = True
+                break
+        if not matched_brenk:
+            brenk_results[idx] = ("", "")
+        
+        # PAINS filtering (only if passed Brenk)
+        if process_pains and brenk_results[idx][0] == "":
+            matched_pains = False
+            for pains_class, filter_name, patt in compiled_pains:
+                if patt and mol.HasSubstructMatch(patt):
+                    pains_results[idx] = (f"PAINS({pains_class})", filter_name)
+                    matched_pains = True
+                    break
+            if not matched_pains:
+                pains_results[idx] = ("", "")
+        else:
+            pains_results[idx] = ("", "")
     
-    for relative_path in paths_to_clean:
-        full_path = os.path.join(base_path, relative_path)
-        if os.path.exists(full_path):
-            for item in os.listdir(full_path):
-                item_path = os.path.join(full_path, item)
-                if item.endswith(('.csv', '.json', '.smi', '.sdf')):
-                    os.remove(item_path)
-                    removed_count += 1
-                    if verbose:
-                        print(f"Removed: {item_path}")
-    
-    # Clean __pycache__ directories
-    for root, dirs, _ in os.walk(base_path):
-        for dir_name in dirs:
-            if dir_name == "__pycache__":
-                pycache_path = os.path.join(root, dir_name)
-                shutil.rmtree(pycache_path)
-                removed_count += 1
-                if verbose:
-                    print(f"Removed: {pycache_path}")
-    
-    # Clean .ipynb_checkpoints
-    for root, dirs, _ in os.walk(base_path):
-        for dir_name in dirs:
-            if dir_name == ".ipynb_checkpoints":
-                checkpoint_path = os.path.join(root, dir_name)
-                shutil.rmtree(checkpoint_path)
-                removed_count += 1
-                if verbose:
-                    print(f"Removed: {checkpoint_path}")
-    
-    if verbose:
-        print(f"[Cleanup] Removed {removed_count} generated files/directories")
+    return brenk_results, pains_results
 
 
 def filter_BrenkPAINS(
@@ -790,6 +540,7 @@ def filter_BrenkPAINS(
     smiles_col: str = "SMILES",
     id_col: str = "ID",
     print_report: bool = True,
+    n_workers: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Filter out compounds containing Brenk structural alerts or PAINS substructures.
 
@@ -810,6 +561,7 @@ def filter_BrenkPAINS(
         smiles_col: Column containing SMILES strings (default: ``"SMILES"``).
         id_col: Column containing compound IDs (default: ``"ID"``).
         print_report: Print acceptance/rejection summary (default: True).
+        n_workers: Number of parallel workers (default: cpu_count - 1).
 
     Returns:
         Tuple of (accepted, rejected) DataFrames.
@@ -817,76 +569,57 @@ def filter_BrenkPAINS(
     Raises:
         ValueError: If required columns are missing.
     """
-    from py_utils._smarts_catalog import BRENK_ALERTS, PAINS_ALERTS
-
     if smiles_col not in df.columns:
         raise ValueError(f"Missing column '{smiles_col}'.")
     if id_col not in df.columns:
         raise ValueError(f"Missing column '{id_col}'.")
 
     out_df = df.copy()
-
-    # First stage: Brenk filtering
-    brenk_match_alerts: list[str] = []
-    brenk_substructures: list[str] = []
-    compiled_brenk: list[tuple[str, Chem.Mol | None]] = []
     
-    for alert_name, smarts in BRENK_ALERTS.items():
-        patt = Chem.MolFromSmarts(smarts)
-        compiled_brenk.append((alert_name, patt))
-
-    for smi in out_df[smiles_col].astype(str):
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            brenk_match_alerts.append("invalid_smiles")
-            brenk_substructures.append("")
-            continue
+    # Prepare items for parallel processing
+    smiles_list = out_df[smiles_col].astype(str).tolist()
+    
+    # Stage 1: Brenk filtering with multiprocessing
+    n_workers = _get_n_workers(n_workers)
+    
+    # Create batch items - include flag for whether to process PAINS (will be determined later)
+    items = [(i, smi, True) for i, smi in enumerate(smiles_list)]
+    
+    # Split into batches
+    if len(items) >= 1000 and n_workers > 1:
+        batch_size = max(1, len(items) // (n_workers * 10))
+        batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
         
-        matched = False
-        for alert_name, patt in compiled_brenk:
-            if patt and mol.HasSubstructMatch(patt):
-                brenk_match_alerts.append("Brenk")
-                brenk_substructures.append(alert_name)
-                matched = True
-                break
-        if not matched:
-            brenk_match_alerts.append("")
-            brenk_substructures.append("")
-
-    out_df["MatchAlert"] = brenk_match_alerts
-    out_df["Substructure"] = brenk_substructures
+        with mp.Pool(processes=n_workers) as pool:
+            results = pool.map(_process_brenk_pains_batch, batches)
+        
+        # Merge results from all batches
+        brenk_results: dict[int, tuple[str, str]] = {}
+        pains_results: dict[int, tuple[str, str]] = {}
+        
+        for batch_brenk, batch_pains in results:
+            brenk_results.update(batch_brenk)
+            pains_results.update(batch_pains)
+    else:
+        # Sequential processing for small datasets
+        brenk_results, pains_results = _process_brenk_pains_batch(items)
+    
+    # Apply results to DataFrame
+    out_df["MatchAlert"] = [brenk_results.get(i, ("", ""))[0] for i in range(len(out_df))]
+    out_df["Substructure"] = [brenk_results.get(i, ("", ""))[1] for i in range(len(out_df))]
     
     # Keep accepted Brenk compounds for PAINS filtering
     brenk_accepted = out_df[out_df["MatchAlert"] == ""].copy()
     brenk_rejected = out_df[out_df["MatchAlert"] != ""].copy()
     
-    # Second stage: PAINS filtering (on Brenk-accepted compounds only)
+    # Apply PAINS results to Brenk-accepted compounds
     pains_match_alerts: list[str] = []
     pains_substructures: list[str] = []
-    compiled_pains: list[tuple[str, str, Chem.Mol | None]] = []
     
-    for pains_class, smarts_dict in PAINS_ALERTS.items():
-        for filter_name, smarts in smarts_dict.items():
-            patt = Chem.MolFromSmarts(smarts)
-            compiled_pains.append((pains_class, filter_name, patt))
-
-    for smi in brenk_accepted[smiles_col].astype(str):
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            pains_match_alerts.append("invalid_smiles")
-            pains_substructures.append("")
-            continue
-        
-        matched = False
-        for pains_class, filter_name, patt in compiled_pains:
-            if patt and mol.HasSubstructMatch(patt):
-                pains_match_alerts.append(f"PAINS({pains_class})")
-                pains_substructures.append(filter_name)
-                matched = True
-                break
-        if not matched:
-            pains_match_alerts.append("")
-            pains_substructures.append("")
+    for idx in brenk_accepted.index:
+        pains_result = pains_results.get(idx, ("", ""))
+        pains_match_alerts.append(pains_result[0])
+        pains_substructures.append(pains_result[1])
     
     brenk_accepted["MatchAlert"] = pains_match_alerts
     brenk_accepted["Substructure"] = pains_substructures
