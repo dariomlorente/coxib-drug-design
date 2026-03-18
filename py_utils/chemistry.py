@@ -21,6 +21,26 @@ from py_utils._resources import _get_n_workers, _get_ram_budget_gb
 # Cache directory for persistent storage
 DEFAULT_CACHE_DIR = Path("mol_files/3. Oxazolones/.cache")
 
+# Reaction SMARTS constants (DRY — used in both main and worker functions)
+_SMARTS_EP_REACTION = (
+    "([#6:42][CX3H:41](=[O:91])).([#6:21][CX3:2](=[O:1])[OX1H0-,OX2H1,Cl,Br,I:92])."
+    "([O:51]=[C:5]([OH1:90])[CH2:4][NH2:3])>>"
+    "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+    "([OH:90]).([OH:91]).([O:92])"
+)
+_SMARTS_AG_REACTION = (
+    "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+    "([NX3H2:10][*:11])>>"
+    "([O:51]=[C:5]1[NX3:10]([*:11])[C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+    "([OX2H2:1])"
+)
+_SMARTS_SE_REACTION = (
+    "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+    "([C:93][C:94](=[O:85])[SX2H:10])>>"
+    "([O:51]=[C:5]1[SX2:10][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
+    "([C:93][C:94](=[O:85])[OX2H:1])"
+)
+
 
 def _get_cache_key(*args) -> str:
     """Generate a cache key from arguments using SHA256."""
@@ -50,6 +70,20 @@ def _save_cache(cache_file: Path, cache: dict[str, Any]) -> None:
         pass
 
 
+def _append_to_temp_csv(
+    out_rows: list[dict],
+    temp_csv_path: Path,
+    is_first_chunk: bool = True,
+) -> None:
+    """Append rows to a temp CSV file (streaming write)."""
+    if not out_rows:
+        return
+    temp_df = pd.DataFrame(out_rows)
+    mode = "w" if is_first_chunk else "a"
+    header = is_first_chunk
+    temp_df.to_csv(temp_csv_path, mode=mode, index=False, header=header)
+
+
 def rxn_ErlenmeyerPlochl(
     df_aldehyde: pd.DataFrame,
     df_carboxylic: pd.DataFrame,
@@ -62,10 +96,19 @@ def rxn_ErlenmeyerPlochl(
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     n_workers: int | None = None,
+    chunk_size: int = 50,
+    output_csv: str | Path | None = None,
+    checkpoint_csv: str | Path | None = None,
 ) -> pd.DataFrame:
     """
-    Erlenmeyer-Plochl reaction: combines aldehydes with carboxylic acids
+    Erlenmeyer-Plöchl reaction: combines aldehydes with carboxylic acids
     (or derivatives) and glycine to form oxazolones.
+
+    Uses chunked streaming to limit memory usage - processes aldehydes in
+    batches of `chunk_size`, writing intermediate results to disk.
+
+    Supports checkpoint-based resume: if checkpoint_csv exists, skips already-processed
+    aldehyde IDs on restart.
 
     Parameters:
         df_aldehyde: DataFrame with aldehyde compounds.
@@ -79,9 +122,14 @@ def rxn_ErlenmeyerPlochl(
         use_cache: Use persistent cache (default: True).
         cache_file: Cache file path (default: auto-generated).
         n_workers: Number of parallel workers (default: cpu_count - 1).
+        chunk_size: Number of aldehydes per chunk (default: 50).
+        output_csv: If provided, write final result to this CSV file.
+            Skips in-memory deduplication for large datasets.
+        checkpoint_csv: If provided, use this file for checkpoint-based resume.
 
     Returns:
-        DataFrame with oxazolone products.
+        DataFrame with oxazolone products. If output_csv is provided, the
+        returned DataFrame may be loaded from the CSV file.
     """
     # Validate inputs
     for df, name, id_col in [(df_aldehyde, "aldehyde", id_col_aldehyde),
@@ -115,12 +163,7 @@ def rxn_ErlenmeyerPlochl(
         raise ValueError("Failed to build glycine reagent Mol (invalid SMILES).")
 
     # Reaction SMARTS: aldehyde + carboxylic acid + glycine → oxazolone + byproduct
-    rxn_ep = rdChemReactions.ReactionFromSmarts(
-        "([#6:42][CX3H:41](=[O:91])).([#6:21][CX3:2](=[O:1])[OX1H0-,OX2H1,Cl,Br,I:92])."
-        "([O:51]=[C:5]([OH1:90])[CH2:4][NH2:3])>>"
-        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([OH:90]).([OH:91]).([O:92])"
-    )
+    rxn_ep = rdChemReactions.ReactionFromSmarts(_SMARTS_EP_REACTION)
 
     if rxn_ep is None:
         raise ValueError("Failed to build reaction from SMARTS.")
@@ -139,112 +182,197 @@ def rxn_ErlenmeyerPlochl(
         "cache_misses": 0,
     }
 
-    # Pre-process aldehydes
-    valid_aldehydes: list[tuple[str, str, float]] = []  # (smi, id, price)
-    for _, row in df_aldehyde.iterrows():
-        smi = str(row[smiles_col])
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            stats["invalid_aldehyde"] += 1
-        elif mol.HasSubstructMatch(patt_aldehyde):
-            valid_aldehydes.append((smi, str(row[id_col_aldehyde]), float(row[price_col])))
-        else:
-            stats["not_aldehyde"] += 1
+    # Pre-process aldehydes (vectorized)
+    ald_smiles = df_aldehyde[smiles_col].astype(str)
+    ald_mols = ald_smiles.map(Chem.MolFromSmiles)
+    ald_valid = ald_mols.notna()
+    ald_match = ald_valid & ald_mols.map(
+        lambda m: m.HasSubstructMatch(patt_aldehyde) if m is not None else False
+    )
+    
+    valid_aldehydes: list[tuple[str, str, float]] = [
+        (smi, str(id_), float(price))
+        for smi, id_, price in zip(
+            df_aldehyde.loc[ald_match, smiles_col],
+            df_aldehyde.loc[ald_match, id_col_aldehyde],
+            df_aldehyde.loc[ald_match, price_col],
+        )
+    ]
+    stats["invalid_aldehyde"] = int((~ald_valid).sum())
+    stats["not_aldehyde"] = int((ald_valid & ~ald_match).sum())
 
-    # Pre-process carboxylic acids
-    valid_carboxylics: list[tuple[str, str, float]] = []  # (smi, id, price)
-    for _, row in df_carboxylic.iterrows():
-        smi = str(row[smiles_col])
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            stats["invalid_carboxyl"] += 1
-        elif mol.HasSubstructMatch(patt_carboxyl):
-            valid_carboxylics.append((smi, str(row[id_col_carboxyl]), float(row[price_col])))
-        else:
-            stats["not_carboxyl"] += 1
+    # Pre-process carboxylic acids (vectorized)
+    carb_smiles = df_carboxylic[smiles_col].astype(str)
+    carb_mols = carb_smiles.map(Chem.MolFromSmiles)
+    carb_valid = carb_mols.notna()
+    carb_match = carb_valid & carb_mols.map(
+        lambda m: m.HasSubstructMatch(patt_carboxyl) if m is not None else False
+    )
+    
+    valid_carboxylics: list[tuple[str, str, float]] = [
+        (smi, str(id_), float(price))
+        for smi, id_, price in zip(
+            df_carboxylic.loc[carb_match, smiles_col],
+            df_carboxylic.loc[carb_match, id_col_carboxyl],
+            df_carboxylic.loc[carb_match, price_col],
+        )
+    ]
+    stats["invalid_carboxyl"] = int((~carb_valid).sum())
+    stats["not_carboxyl"] = int((carb_valid & ~carb_match).sum())
 
-    # Cache check
-    out_rows: list[dict] = []
-    work_items: list[tuple[int, int]] = []
+    # Setup temp file for streaming results
+    if checkpoint_csv is not None:
+        temp_csv_path = Path(checkpoint_csv)
+    else:
+        temp_csv_path = cache_file.parent / ".tmp_ep_results.csv"
+    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for i, (ald_smi, ald_id, ald_price) in enumerate(valid_aldehydes):
-        for j, (carb_smi, carb_id, carb_price) in enumerate(valid_carboxylics):
-            cache_key = _get_cache_key(ald_smi, carb_smi, smiles_gly)
+    # Check for existing checkpoint to resume from
+    completed_ald_ids: set[str] = set()
+    is_resuming = False
+    if temp_csv_path.exists():
+        try:
+            checkpoint_df = pd.read_csv(temp_csv_path)
+            if "ID" in checkpoint_df.columns:
+                # E-P IDs are like A{num}C{num}, extract aldehyde ID prefix
+                completed_ald_ids = set(
+                    id_str.rsplit("C", 1)[0] for id_str in checkpoint_df["ID"].unique()
+                    if "C" in id_str
+                )
+                is_resuming = True
+                if print_report:
+                    print(f"[ErlenmeyerPlochl] Resuming from checkpoint: "
+                          f"{len(completed_ald_ids):,} aldehydes already processed")
+        except Exception:
+            pass
 
-            if use_cache and cache_key in cache:
-                cached_result = cache[cache_key]
-                if cached_result:
-                    price_total = ald_price + carb_price
-                    for prod_data in cached_result:
-                        out_rows.append({
-                            "ID": f"{ald_id}C{carb_id}",
-                            "SMILES": prod_data["smiles"],
-                            "PriceMol": price_total,
-                            **{k: v for k, v in prod_data.items() if k != "smiles"},
-                        })
-                cache_hits += 1
+    # Filter to skip already-processed aldehydes
+    if is_resuming:
+        valid_aldehydes = [
+            (smi, ald_id, price) for smi, ald_id, price in valid_aldehydes
+            if ald_id not in completed_ald_ids
+        ]
+        if print_report:
+            print(f"[ErlenmeyerPlochl] Processing {len(valid_aldehydes):,} remaining aldehydes")
+
+    cache_hits = 0
+    cache_misses = 0
+    
+    # Chunked processing loop
+    n_chunks = (len(valid_aldehydes) + chunk_size - 1) // chunk_size
+    
+    for chunk_idx in range(n_chunks):
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, len(valid_aldehydes))
+        chunk_aldehydes = valid_aldehydes[chunk_start:chunk_end]
+        
+        if print_report and n_chunks > 1:
+            print(f"[ErlenmeyerPlochl] Processing chunk {chunk_idx + 1}/{n_chunks} "
+                  f"({len(chunk_aldehydes)} aldehydes × {len(valid_carboxylics)} carboxylics)")
+        
+        out_rows: list[dict] = []
+        work_items: list[tuple[int, int]] = []
+        new_cache_entries: dict[str, list] = {}
+        
+        # Cache check for this chunk
+        for i, (ald_smi, ald_id, ald_price) in enumerate(chunk_aldehydes):
+            for j, (carb_smi, carb_id, carb_price) in enumerate(valid_carboxylics):
+                cache_key = _get_cache_key(ald_smi, carb_smi, smiles_gly)
+                
+                if use_cache and cache_key in cache:
+                    cached_result = cache[cache_key]
+                    if cached_result:
+                        price_total = ald_price + carb_price
+                        ald_num = ald_id.lstrip('A')
+                        carb_num = carb_id.lstrip('C')
+                        for prod_data in cached_result:
+                            out_rows.append({
+                                "ID": f"A{ald_num}C{carb_num}",
+                                "SMILES": prod_data["smiles"],
+                                "PriceMol": price_total,
+                                "MW": prod_data["MW"],
+                                "HBA": prod_data["HBA"],
+                                "HBD": prod_data["HBD"],
+                                "RotB": prod_data["RotB"],
+                                "HvyAtm": prod_data["HvyAtm"],
+                                "Rings": prod_data["Rings"],
+                                "HetAtm": prod_data["HetAtm"],
+                            })
+                    cache_hits += 1
+                else:
+                    work_items.append((i, j))
+                    cache_misses += 1
+
+        if print_report and chunk_idx == 0:
+            total_pairs = len(valid_aldehydes) * len(valid_carboxylics)
+            print(f"[ErlenmeyerPlochl] {total_pairs:,} total pairs "
+                  f"({n_chunks} chunks of ~{chunk_size} aldehydes)")
+        
+        # Parallel computation for this chunk's work items
+        if work_items:
+            n_workers = _get_n_workers(n_workers)
+            
+            if len(work_items) >= 1000 and n_workers > 1:
+                batch_size = max(1, len(work_items) // (n_workers * 10))
+                batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
+                
+                worker_fn = partial(
+                    _process_ep_batch,
+                    ald_data=chunk_aldehydes,
+                    carb_data=valid_carboxylics,
+                    smiles_gly=smiles_gly,
+                    keep_mol=keep_mol,
+                )
+                
+                with mp.Pool(processes=n_workers) as pool:
+                    results = pool.map(worker_fn, batches)
+                
+                for batch_rows, batch_cache, batch_stats in results:
+                    out_rows.extend(batch_rows)
+                    new_cache_entries.update(batch_cache)
+                    stats["no_product"] += batch_stats["no_product"]
+                    stats["problematic"] += batch_stats["problematic"]
             else:
-                work_items.append((i, j))
-                cache_misses += 1
-
-    if print_report:
-        total_pairs = len(valid_aldehydes) * len(valid_carboxylics)
-        print(f"[ErlenmeyerPlochl] {total_pairs:,} total pairs: "
-              f"{cache_hits:,} cache hits, {cache_misses:,} misses")
-
-    # Parallel computation
-    if work_items:
-        n_workers = _get_n_workers(n_workers)
-
-        if len(work_items) >= 1000 and n_workers > 1:
-            batch_size = max(1, len(work_items) // (n_workers * 10))
-            batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
-
-            if print_report:
-                print(f"[ErlenmeyerPlochl] Processing {len(work_items):,} "
-                      f"misses with {n_workers} workers ({len(batches)} batches)...")
-
-            worker_fn = partial(
-                _process_ep_batch,
-                ald_data=valid_aldehydes,
-                carb_data=valid_carboxylics,
-                smiles_gly=smiles_gly,
-                keep_mol=keep_mol,
-            )
-
-            with mp.Pool(processes=n_workers) as pool:
-                results = pool.map(worker_fn, batches)
-
-            for batch_rows, batch_cache, batch_stats in results:
+                batch_rows, batch_cache, batch_stats = _process_ep_batch(
+                    work_items, chunk_aldehydes, valid_carboxylics, smiles_gly, keep_mol
+                )
                 out_rows.extend(batch_rows)
                 new_cache_entries.update(batch_cache)
                 stats["no_product"] += batch_stats["no_product"]
                 stats["problematic"] += batch_stats["problematic"]
-        else:
-            if print_report and work_items:
-                print(f"[ErlenmeyerPlochl] Processing {len(work_items):,} "
-                      f"misses in main thread (< 1000)...")
-            batch_rows, batch_cache, batch_stats = _process_ep_batch(
-                work_items, valid_aldehydes, valid_carboxylics, smiles_gly, keep_mol
-            )
-            out_rows.extend(batch_rows)
-            new_cache_entries.update(batch_cache)
-            stats["no_product"] += batch_stats["no_product"]
-            stats["problematic"] += batch_stats["problematic"]
+        
+        # Flush chunk results to temp CSV
+        _append_to_temp_csv(out_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0))
+        
+        # Flush cache incrementally
+        if use_cache and new_cache_entries:
+            cache.update(new_cache_entries)
+            _save_cache(cache_file, cache)
 
-    # Save cache
-    if use_cache and new_cache_entries:
-        cache.update(new_cache_entries)
-        _save_cache(cache_file, cache)
-
-    out_df = pd.DataFrame(out_rows)
+    # Read all results from temp CSV and deduplicate
+    if temp_csv_path.exists():
+        out_df = pd.read_csv(temp_csv_path)
+        
+        # Deduplicate in memory
+        if len(out_df) > 0:
+            out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
+            out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
+        
+        # If output_csv is provided, write to it
+        if output_csv is not None:
+            output_path = Path(output_csv)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            out_df.to_csv(output_path, index=False)
+            if print_report:
+                print(f"[ErlenmeyerPlochl] Written to: {output_path}")
+        
+        temp_csv_path.unlink()  # Delete temp file
+    else:
+        out_df = pd.DataFrame()
+    
     stats["output_rows"] = len(out_df)
     stats["cache_hits"] = cache_hits
     stats["cache_misses"] = cache_misses
-
-    if len(out_df) > 0:
-        out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
-        out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
 
     if print_report:
         if use_cache:
@@ -265,12 +393,7 @@ def _process_ep_batch(
     keep_mol: bool = False,
 ) -> tuple[list[dict], dict[str, list], dict[str, int]]:
     """Worker function for Erlenmeyer-Plochl parallel computation."""
-    rxn_ep = rdChemReactions.ReactionFromSmarts(
-        "([#6:42][CX3H:41](=[O:91])).([#6:21][CX3:2](=[O:1])[OX1H0-,OX2H1,Cl,Br,I:92])."
-        "([O:51]=[C:5]([OH1:90])[CH2:4][NH2:3])>>"
-        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([OH:90]).([OH:91]).([O:92])"
-    )
+    rxn_ep = rdChemReactions.ReactionFromSmarts(_SMARTS_EP_REACTION)
     mol_gly = Chem.MolFromSmiles(smiles_gly)
 
     out_rows: list[dict] = []
@@ -327,11 +450,19 @@ def _process_ep_batch(
                 }
                 product_data_list.append(prod_data)
 
+                ald_num = ald_id.lstrip('A')
+                carb_num = carb_id.lstrip('C')
                 new_row: dict = {
-                    "ID": f"{ald_id}C{carb_id}",
+                    "ID": f"A{ald_num}C{carb_num}",
                     "SMILES": psmi,
                     "PriceMol": price_total,
-                    **{k: v for k, v in prod_data.items() if k != "smiles"},
+                    "MW": prod_data["MW"],
+                    "HBA": prod_data["HBA"],
+                    "HBD": prod_data["HBD"],
+                    "RotB": prod_data["RotB"],
+                    "HvyAtm": prod_data["HvyAtm"],
+                    "Rings": prod_data["Rings"],
+                    "HetAtm": prod_data["HetAtm"],
                 }
                 if keep_mol:
                     new_row["Mol"] = prod_mol
@@ -356,9 +487,18 @@ def rxn_AminolysisGFPc(
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     n_workers: int | None = None,
+    chunk_size: int = 500,
+    output_csv: str | Path | None = None,
+    checkpoint_csv: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Aminolysis-GFPc reaction: opens oxazolone rings with amines to form imidazolones.
+
+    Uses chunked streaming to limit memory usage - processes oxazolones in
+    batches of `chunk_size`, writing intermediate results to disk.
+
+    Supports checkpoint-based resume: if checkpoint_csv exists, skips already-processed
+    oxazolone IDs on restart.
 
     Parameters:
         df_oxazolones: DataFrame with oxazolone compounds.
@@ -372,6 +512,11 @@ def rxn_AminolysisGFPc(
         use_cache: Use persistent cache (default: True).
         cache_file: Cache file path (default: auto-generated).
         n_workers: Number of parallel workers (default: cpu_count - 1).
+        chunk_size: Number of oxazolones per chunk (default: 500).
+        output_csv: If provided, write final result to this CSV file.
+        checkpoint_csv: If provided, use this file for checkpoint-based resume.
+            Results are appended to this file after each chunk.
+            On restart, already-processed oxazolone IDs are skipped.
 
     Returns:
         DataFrame with imidazolone products.
@@ -409,12 +554,7 @@ def rxn_AminolysisGFPc(
         raise ValueError("Failed to build amine pattern from SMARTS.")
 
     # Reaction SMARTS: oxazolone + primary amine → imidazolone + water
-    rxn_ag = rdChemReactions.ReactionFromSmarts(
-        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([NX3H2:10][*:11])>>"
-        "([O:51]=[C:5]1[NX3:10]([*:11])[C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([OX2H2:1])"
-    )
+    rxn_ag = rdChemReactions.ReactionFromSmarts(_SMARTS_AG_REACTION)
 
     if rxn_ag is None:
         raise ValueError("Failed to build reaction from SMARTS.")
@@ -433,111 +573,207 @@ def rxn_AminolysisGFPc(
         "cache_misses": 0,
     }
 
-    # Pre-process oxazolones
-    valid_oxazolones: list[tuple[str, str, float]] = []  # (smi, id, price)
-    for _, row in df_oxazolones.iterrows():
-        smi = str(row[smiles_col])
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            stats["invalid_oxazolone"] += 1
-        elif mol.HasSubstructMatch(patt_oxazolone):
-            valid_oxazolones.append((smi, str(row[id_col_oxazolone]), float(row[price_col])))
-        else:
-            stats["not_oxazolone"] += 1
+    # Pre-process oxazolones (vectorized)
+    ox_smiles = df_oxazolones[smiles_col].astype(str)
+    ox_mols = ox_smiles.map(Chem.MolFromSmiles)
+    ox_valid = ox_mols.notna()
+    ox_match = ox_valid & ox_mols.map(
+        lambda m: m.HasSubstructMatch(patt_oxazolone) if m is not None else False
+    )
+    
+    valid_oxazolones: list[tuple[str, str, float]] = [
+        (smi, str(id_), float(price))
+        for smi, id_, price in zip(
+            df_oxazolones.loc[ox_match, smiles_col],
+            df_oxazolones.loc[ox_match, id_col_oxazolone],
+            df_oxazolones.loc[ox_match, price_col],
+        )
+    ]
+    stats["invalid_oxazolone"] = int((~ox_valid).sum())
+    stats["not_oxazolone"] = int((ox_valid & ~ox_match).sum())
 
-    # Pre-process amines
-    valid_amines: list[tuple[str, str, float]] = []  # (smi, id, price)
-    for _, row in df_amines.iterrows():
-        smi = str(row[smiles_col])
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            stats["invalid_amine"] += 1
-        elif mol.HasSubstructMatch(patt_amine):
-            valid_amines.append((smi, str(row[id_col_amine]), float(row[price_col])))
-        else:
-            stats["not_amine"] += 1
+    # Pre-process amines (vectorized)
+    am_smiles = df_amines[smiles_col].astype(str)
+    am_mols = am_smiles.map(Chem.MolFromSmiles)
+    am_valid = am_mols.notna()
+    am_match = am_valid & am_mols.map(
+        lambda m: m.HasSubstructMatch(patt_amine) if m is not None else False
+    )
+    
+    valid_amines: list[tuple[str, str, float]] = [
+        (smi, str(id_), float(price))
+        for smi, id_, price in zip(
+            df_amines.loc[am_match, smiles_col],
+            df_amines.loc[am_match, id_col_amine],
+            df_amines.loc[am_match, price_col],
+        )
+    ]
+    stats["invalid_amine"] = int((~am_valid).sum())
+    stats["not_amine"] = int((am_valid & ~am_match).sum())
 
-    # Cache check
-    out_rows: list[dict] = []
-    work_items: list[tuple[int, int]] = []
+    # Setup temp file for streaming results
+    # Use checkpoint_csv if provided, otherwise use default temp path
+    if checkpoint_csv is not None:
+        temp_csv_path = Path(checkpoint_csv)
+    else:
+        temp_csv_path = cache_file.parent / ".tmp_ag_results.csv"
+    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Check for existing checkpoint to resume from
+    completed_ox_ids: set[str] = set()
+    is_resuming = False
+    if temp_csv_path.exists():
+        try:
+            checkpoint_df = pd.read_csv(temp_csv_path)
+            if "ID" in checkpoint_df.columns:
+                completed_ox_ids = set(checkpoint_df["ID"].str.replace(r"N\d+$", "", regex=True).unique())
+                is_resuming = True
+                if print_report:
+                    print(f"[AminolysisGFPc] Resuming from checkpoint: "
+                          f"{len(completed_ox_ids):,} oxazolones already processed")
+        except Exception:
+            pass
+    
+    cache_hits = 0
+    cache_misses = 0
+    
+    # Chunked processing loop
+    n_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size
+    
+    # Filter valid_oxazolones to skip already-processed ones
+    if is_resuming:
+        valid_oxazolones_filtered = [
+            (smi, ox_id, price) for smi, ox_id, price in valid_oxazolones
+            if ox_id not in completed_ox_ids
+        ]
+        if print_report:
+            print(f"[AminolysisGFPc] Skipping {len(completed_ox_ids):,} completed oxazolones, "
+                  f"processing {len(valid_oxazolones_filtered):,} remaining")
+        valid_oxazolones = valid_oxazolones_filtered
+        n_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size
+    
+    for chunk_idx in range(n_chunks):
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, len(valid_oxazolones))
+        chunk_oxazolones = valid_oxazolones[chunk_start:chunk_end]
+        
+        if print_report and n_chunks > 1 and (chunk_idx + 1) % 500 == 0:
+            print(f"[AminolysisGFPc] Processing chunk {chunk_idx + 1}/{n_chunks} "
+                  f"({chunk_idx * chunk_size:,} oxazolones processed)")
+        
+        out_rows: list[dict] = []
+        work_items: list[tuple[int, int]] = []
+        new_cache_entries: dict[str, list] = {}
+        
+        # Cache check for this chunk - with pattern validation to skip invalid amines
+        for i, (ox_smi, ox_id, ox_price) in enumerate(chunk_oxazolones):
+            for j, (am_smi, am_id, am_price) in enumerate(valid_amines):
+                # OPTIMIZATION: Validate amine before cache lookup
+                am_mol = Chem.MolFromSmiles(am_smi)
+                if am_mol is None or not am_mol.HasSubstructMatch(patt_amine):
+                    continue  # Skip invalid amines
+                
+                cache_key = _get_cache_key(ox_smi, am_smi)
+                
+                if use_cache and cache_key in cache:
+                    cached_result = cache[cache_key]
+                    if cached_result:
+                        price_total = ox_price + am_price
+                        am_num = am_id.lstrip('N')
+                        for prod_data in cached_result:
+                            out_rows.append({
+                                "ID": f"{ox_id}N{am_num}",
+                                "SMILES": prod_data["smiles"],
+                                "PriceMol": price_total,
+                                "MW": prod_data["MW"],
+                                "HBA": prod_data["HBA"],
+                                "HBD": prod_data["HBD"],
+                                "RotB": prod_data["RotB"],
+                                "HvyAtm": prod_data["HvyAtm"],
+                                "Rings": prod_data["Rings"],
+                                "HetAtm": prod_data["HetAtm"],
+                            })
+                    cache_hits += 1
+                else:
+                    work_items.append((i, j))
+                    cache_misses += 1
 
-    for i, (ox_smi, ox_id, ox_price) in enumerate(valid_oxazolones):
-        for j, (am_smi, am_id, am_price) in enumerate(valid_amines):
-            cache_key = _get_cache_key(ox_smi, am_smi)
-
-            if use_cache and cache_key in cache:
-                cached_result = cache[cache_key]
-                if cached_result:
-                    price_total = ox_price + am_price
-                    for prod_data in cached_result:
-                        out_rows.append({
-                            "ID": f"{ox_id}A{am_id}",
-                            "SMILES": prod_data["smiles"],
-                            "PriceMol": price_total,
-                            **{k: v for k, v in prod_data.items() if k != "smiles"},
-                        })
-                cache_hits += 1
+        if print_report and chunk_idx == 0:
+            total_pairs = len(valid_oxazolones) * len(valid_amines)
+            print(f"[AminolysisGFPc] {total_pairs:,} total pairs "
+                  f"({n_chunks} chunks of ~{chunk_size} oxazolones)")
+        
+        # Parallel computation for this chunk's work items
+        if work_items:
+            n_workers = _get_n_workers(n_workers)
+            
+            if len(work_items) >= 1000 and n_workers > 1:
+                batch_size = max(1, len(work_items) // (n_workers * 10))
+                batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
+                
+                worker_fn = partial(
+                    _process_ag_batch,
+                    ox_data=chunk_oxazolones,
+                    am_data=valid_amines,
+                    keep_mol=keep_mol,
+                )
+                
+                with mp.Pool(processes=n_workers) as pool:
+                    results = pool.map(worker_fn, batches)
+                
+                for batch_rows, batch_cache, batch_stats in results:
+                    out_rows.extend(batch_rows)
+                    new_cache_entries.update(batch_cache)
+                    stats["no_product"] += batch_stats["no_product"]
+                    stats["problematic"] += batch_stats["problematic"]
             else:
-                work_items.append((i, j))
-                cache_misses += 1
-
-    if print_report:
-        total_pairs = len(valid_oxazolones) * len(valid_amines)
-        print(f"[AminolysisGFPc] {total_pairs:,} total pairs: "
-              f"{cache_hits:,} cache hits, {cache_misses:,} misses")
-
-    # Parallel computation
-    if work_items:
-        n_workers = _get_n_workers(n_workers)
-
-        if len(work_items) >= 1000 and n_workers > 1:
-            batch_size = max(1, len(work_items) // (n_workers * 10))
-            batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
-
-            if print_report:
-                print(f"[AminolysisGFPc] Processing {len(work_items):,} "
-                      f"misses with {n_workers} workers ({len(batches)} batches)...")
-
-            worker_fn = partial(
-                _process_ag_batch,
-                ox_data=valid_oxazolones,
-                am_data=valid_amines,
-                keep_mol=keep_mol,
-            )
-
-            with mp.Pool(processes=n_workers) as pool:
-                results = pool.map(worker_fn, batches)
-
-            for batch_rows, batch_cache, batch_stats in results:
+                batch_rows, batch_cache, batch_stats = _process_ag_batch(
+                    work_items, chunk_oxazolones, valid_amines, keep_mol
+                )
                 out_rows.extend(batch_rows)
                 new_cache_entries.update(batch_cache)
                 stats["no_product"] += batch_stats["no_product"]
                 stats["problematic"] += batch_stats["problematic"]
-        else:
-            if print_report and work_items:
-                print(f"[AminolysisGFPc] Processing {len(work_items):,} "
-                      f"misses in main thread (< 1000)...")
-            batch_rows, batch_cache, batch_stats = _process_ag_batch(
-                work_items, valid_oxazolones, valid_amines, keep_mol
-            )
-            out_rows.extend(batch_rows)
-            new_cache_entries.update(batch_cache)
-            stats["no_product"] += batch_stats["no_product"]
-            stats["problematic"] += batch_stats["problematic"]
-
-    # Save cache
-    if use_cache and new_cache_entries:
-        cache.update(new_cache_entries)
+        
+        # Flush chunk results to temp CSV
+        _append_to_temp_csv(out_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0))
+        
+        # Flush cache every 500 chunks (not every chunk) to reduce disk I/O
+        if use_cache and new_cache_entries:
+            cache.update(new_cache_entries)
+            if (chunk_idx + 1) % 500 == 0:
+                _save_cache(cache_file, cache)
+    
+    # Save final cache after all chunks complete
+    if use_cache and cache:
         _save_cache(cache_file, cache)
+        if print_report:
+            print(f"[AminolysisGFPc] Cache saved to: {cache_file}")
 
-    out_df = pd.DataFrame(out_rows)
+    # Read all results from temp CSV and deduplicate
+    if temp_csv_path.exists():
+        out_df = pd.read_csv(temp_csv_path)
+        
+        # Deduplicate in memory
+        if len(out_df) > 0:
+            out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
+            out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
+        
+        # If output_csv is provided, write to it
+        if output_csv is not None:
+            output_path = Path(output_csv)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            out_df.to_csv(output_path, index=False)
+            if print_report:
+                print(f"[AminolysisGFPc] Written to: {output_path}")
+        
+        temp_csv_path.unlink()  # Delete temp file
+    else:
+        out_df = pd.DataFrame()
+    
     stats["output_rows"] = len(out_df)
     stats["cache_hits"] = cache_hits
     stats["cache_misses"] = cache_misses
-
-    if len(out_df) > 0:
-        out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
-        out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
 
     if print_report:
         if use_cache:
@@ -545,6 +781,9 @@ def rxn_AminolysisGFPc(
             hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0
             print(f"[AminolysisGFPc] Cache: {cache_hits} hits, "
                   f"{cache_misses} misses ({hit_rate:.1f}% hit rate)")
+            if hit_rate < 1.0:
+                print(f"[AminolysisGFPc] ⚠️  Low cache hit rate ({hit_rate:.1f}%) - "
+                      f"consider disabling cache for this run")
         print(f"[AminolysisGFPc] Stats: {stats}")
 
     return out_df
@@ -557,12 +796,7 @@ def _process_ag_batch(
     keep_mol: bool = False,
 ) -> tuple[list[dict], dict[str, list], dict[str, int]]:
     """Worker function for Aminolysis-GFPc parallel computation."""
-    rxn_ag = rdChemReactions.ReactionFromSmarts(
-        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([NX3H2:10][*:11])>>"
-        "([O:51]=[C:5]1[NX3:10]([*:11])[C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([OX2H2:1])"
-    )
+    rxn_ag = rdChemReactions.ReactionFromSmarts(_SMARTS_AG_REACTION)
 
     out_rows: list[dict] = []
     new_cache: dict[str, list] = {}
@@ -620,11 +854,18 @@ def _process_ag_batch(
                 }
                 product_data_list.append(prod_data)
 
+                am_num = am_id.lstrip('N')
                 new_row: dict = {
-                    "ID": f"{ox_id}A{am_id}",
+                    "ID": f"{ox_id}N{am_num}",
                     "SMILES": psmi,
                     "PriceMol": price_total,
-                    **{k: v for k, v in prod_data.items() if k != "smiles"},
+                    "MW": prod_data["MW"],
+                    "HBA": prod_data["HBA"],
+                    "HBD": prod_data["HBD"],
+                    "RotB": prod_data["RotB"],
+                    "HvyAtm": prod_data["HvyAtm"],
+                    "Rings": prod_data["Rings"],
+                    "HetAtm": prod_data["HetAtm"],
                 }
                 if keep_mol:
                     new_row["Mol"] = prod_mol
@@ -646,9 +887,14 @@ def rxn_SulphurExchange(
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     print_report: bool = True,
+    output_csv: str | Path | None = None,
+    checkpoint_csv: str | Path | None = None,
+    chunk_size: int = 5000,
 ) -> pd.DataFrame:
     """
     Sulphur-Exchange reaction: converts oxazolones to thiazolones by replacing oxygen with sulphur.
+
+    Uses chunked processing for large datasets to enable checkpoint-based resume.
 
     Parameters:
         df_oxazolones: DataFrame with oxazolone compounds.
@@ -659,6 +905,10 @@ def rxn_SulphurExchange(
         use_cache: Use persistent cache (default: True).
         cache_file: Cache file path (default: auto-generated).
         print_report: Print statistics (default: True).
+        output_csv: If provided, write final result to this CSV file.
+        checkpoint_csv: If provided, use this file for checkpoint-based resume.
+            Results are appended to this file after each chunk.
+        chunk_size: Number of oxazolones per chunk for checkpointing (default: 5000).
 
     Returns:
         DataFrame with thiazolone products.
@@ -696,12 +946,7 @@ def rxn_SulphurExchange(
         raise ValueError("Failed to build thioacetic acid reagent Mol (invalid SMILES).")
 
     # Reaction SMARTS: oxazolone + thioacetic acid → thiazolone + acetic acid
-    rxn_se = rdChemReactions.ReactionFromSmarts(
-        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([C:93][C:94](=[O:85])[SX2H:10])>>"
-        "([O:51]=[C:5]1[SX2:10][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([C:93][C:94](=[O:85])[OX2H:1])"
-    )
+    rxn_se = rdChemReactions.ReactionFromSmarts(_SMARTS_SE_REACTION)
 
     if rxn_se is None:
         raise ValueError("Failed to build reaction from SMARTS.")
@@ -718,17 +963,55 @@ def rxn_SulphurExchange(
         "cache_misses": 0,
     }
 
-    # Pre-process oxazolones
-    valid_oxazolones: list[tuple[str, str, float]] = []  # (smi, id, price)
-    for _, row in df_oxazolones.iterrows():
-        smi = str(row[smiles_col])
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            stats["invalid_oxazolone"] += 1
-        elif mol.HasSubstructMatch(patt_oxazolone):
-            valid_oxazolones.append((smi, str(row[id_col]), float(row[price_col])))
-        else:
-            stats["not_oxazolone"] += 1
+    # Pre-process oxazolones (vectorized)
+    ox_smiles = df_oxazolones[smiles_col].astype(str)
+    ox_mols = ox_smiles.map(Chem.MolFromSmiles)
+    ox_valid = ox_mols.notna()
+    ox_match = ox_valid & ox_mols.map(
+        lambda m: m.HasSubstructMatch(patt_oxazolone) if m is not None else False
+    )
+    
+    valid_oxazolones: list[tuple[str, str, float]] = [
+        (smi, str(id_), float(price))
+        for smi, id_, price in zip(
+            df_oxazolones.loc[ox_match, smiles_col],
+            df_oxazolones.loc[ox_match, id_col],
+            df_oxazolones.loc[ox_match, price_col],
+        )
+    ]
+    stats["invalid_oxazolone"] = int((~ox_valid).sum())
+    stats["not_oxazolone"] = int((ox_valid & ~ox_match).sum())
+
+    # Check for existing checkpoint to resume from
+    if checkpoint_csv is not None:
+        temp_csv_path = Path(checkpoint_csv)
+    else:
+        temp_csv_path = cache_file.parent / ".tmp_se_results.csv"
+    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    completed_ox_ids: set[str] = set()
+    is_resuming = False
+    if temp_csv_path.exists():
+        try:
+            checkpoint_df = pd.read_csv(temp_csv_path)
+            if "ID" in checkpoint_df.columns:
+                # Thiazolone IDs end with 'S', extract original oxazolone ID
+                completed_ox_ids = set(checkpoint_df["ID"].str.rstrip("S").unique())
+                is_resuming = True
+                if print_report:
+                    print(f"[SulphurExchange] Resuming from checkpoint: "
+                          f"{len(completed_ox_ids):,} oxazolones already processed")
+        except Exception:
+            pass
+
+    # Filter to skip already-processed oxazolones
+    if is_resuming:
+        valid_oxazolones = [
+            (smi, ox_id, price) for smi, ox_id, price in valid_oxazolones
+            if ox_id not in completed_ox_ids
+        ]
+        if print_report:
+            print(f"[SulphurExchange] Processing {len(valid_oxazolones):,} remaining oxazolones")
 
     # Cache check
     out_rows: list[dict] = []
@@ -746,7 +1029,13 @@ def rxn_SulphurExchange(
                         "ID": f"{ox_id}S",
                         "SMILES": prod_data["smiles"],
                         "PriceMol": price_total,
-                        **{k: v for k, v in prod_data.items() if k != "smiles"},
+                        "MW": prod_data["MW"],
+                        "HBA": prod_data["HBA"],
+                        "HBD": prod_data["HBD"],
+                        "RotB": prod_data["RotB"],
+                        "HvyAtm": prod_data["HvyAtm"],
+                        "Rings": prod_data["Rings"],
+                        "HetAtm": prod_data["HetAtm"],
                     })
             cache_hits += 1
         else:
@@ -757,17 +1046,23 @@ def rxn_SulphurExchange(
         print(f"[SulphurExchange] {len(valid_oxazolones):,} valid oxazolones: "
               f"{cache_hits:,} cache hits, {cache_misses:,} misses")
 
-    # Parallel computation
-    if work_items:
+    # Chunked processing with checkpointing
+    n_chunks = (len(work_items) + chunk_size - 1) // chunk_size if work_items else 0
+
+    for chunk_idx in range(n_chunks):
+        chunk_start = chunk_idx * chunk_size
+        chunk_end = min(chunk_start + chunk_size, len(work_items))
+        chunk_items = work_items[chunk_start:chunk_end]
+
+        if print_report and n_chunks > 1:
+            print(f"[SulphurExchange] Processing chunk {chunk_idx + 1}/{n_chunks} "
+                  f"({len(chunk_items):,} items)")
+
+        # Parallel computation for this chunk
         n_workers = _get_n_workers(None)
-
-        if len(work_items) >= 1000 and n_workers > 1:
-            batch_size = max(1, len(work_items) // (n_workers * 10))
-            batches = [work_items[i:i + batch_size] for i in range(0, len(work_items), batch_size)]
-
-            if print_report:
-                print(f"[SulphurExchange] Processing {len(work_items):,} "
-                      f"misses with {n_workers} workers ({len(batches)} batches)...")
+        if len(chunk_items) >= 1000 and n_workers > 1:
+            batch_size = max(1, len(chunk_items) // (n_workers * 10))
+            batches = [chunk_items[i:i + batch_size] for i in range(0, len(chunk_items), batch_size)]
 
             worker_fn = partial(
                 _process_se_batch,
@@ -779,22 +1074,32 @@ def rxn_SulphurExchange(
             with mp.Pool(processes=n_workers) as pool:
                 results = pool.map(worker_fn, batches)
 
+            chunk_rows: list[dict] = []
             for batch_rows, batch_cache, batch_stats in results:
-                out_rows.extend(batch_rows)
+                chunk_rows.extend(batch_rows)
                 new_cache_entries.update(batch_cache)
                 stats["no_product"] += batch_stats["no_product"]
                 stats["problematic"] += batch_stats["problematic"]
         else:
-            if print_report and work_items:
-                print(f"[SulphurExchange] Processing {len(work_items):,} "
-                      f"misses in main thread (< 1000)...")
-            batch_rows, batch_cache, batch_stats = _process_se_batch(
-                work_items, valid_oxazolones, smiles_thioacetic, thioacetic_price_eq
-            )
-            out_rows.extend(batch_rows)
-            new_cache_entries.update(batch_cache)
-            stats["no_product"] += batch_stats["no_product"]
-            stats["problematic"] += batch_stats["problematic"]
+            if chunk_items:
+                chunk_rows, batch_cache, batch_stats = _process_se_batch(
+                    chunk_items, valid_oxazolones, smiles_thioacetic, thioacetic_price_eq
+                )
+                new_cache_entries.update(batch_cache)
+                stats["no_product"] += batch_stats["no_product"]
+                stats["problematic"] += batch_stats["problematic"]
+            else:
+                chunk_rows = []
+
+        # Append chunk results to checkpoint CSV
+        if chunk_rows:
+            out_rows.extend(chunk_rows)
+            _append_to_temp_csv(chunk_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0 and not is_resuming))
+
+        # Save cache periodically
+        if use_cache and new_cache_entries and (chunk_idx + 1) % 100 == 0:
+            cache.update(new_cache_entries)
+            _save_cache(cache_file, cache)
 
     # Save cache
     if use_cache and new_cache_entries:
@@ -802,13 +1107,23 @@ def rxn_SulphurExchange(
         _save_cache(cache_file, cache)
 
     out_df = pd.DataFrame(out_rows)
-    stats["output_rows"] = len(out_df)
-    stats["cache_hits"] = cache_hits
-    stats["cache_misses"] = cache_misses
-
+    
+    # Deduplicate
     if len(out_df) > 0:
         out_df = out_df.sort_values(by=["SMILES", "PriceMol"], ascending=[True, True])
         out_df = out_df.drop_duplicates(subset=["SMILES"], keep="first").reset_index(drop=True)
+    
+    # If output_csv is provided, write to it
+    if output_csv is not None:
+        output_path = Path(output_csv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        out_df.to_csv(output_path, index=False)
+        if print_report:
+            print(f"[SulphurExchange] Written to: {output_path}")
+    
+    stats["output_rows"] = len(out_df)
+    stats["cache_hits"] = cache_hits
+    stats["cache_misses"] = cache_misses
 
     if print_report:
         if use_cache:
@@ -828,12 +1143,7 @@ def _process_se_batch(
     thioacetic_price_eq: float,
 ) -> tuple[list[dict], dict[str, list], dict[str, int]]:
     """Worker function for Sulphur-Exchange parallel computation."""
-    rxn_se = rdChemReactions.ReactionFromSmarts(
-        "([O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([C:93][C:94](=[O:85])[SX2H:10])>>"
-        "([O:51]=[C:5]1[SX2:10][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42])."
-        "([C:93][C:94](=[O:85])[OX2H:1])"
-    )
+    rxn_se = rdChemReactions.ReactionFromSmarts(_SMARTS_SE_REACTION)
     mol_thioacetic = Chem.MolFromSmiles("[C:93][C:94](=[O:85])[SH:10]")
 
     out_rows: list[dict] = []
@@ -895,7 +1205,13 @@ def _process_se_batch(
                     "ID": f"{ox_id}S",
                     "SMILES": psmi,
                     "PriceMol": ox_price + thioacetic_price_eq,
-                    **{k: v for k, v in prod_data.items() if k != "smiles"},
+                    "MW": prod_data["MW"],
+                    "HBA": prod_data["HBA"],
+                    "HBD": prod_data["HBD"],
+                    "RotB": prod_data["RotB"],
+                    "HvyAtm": prod_data["HvyAtm"],
+                    "Rings": prod_data["Rings"],
+                    "HetAtm": prod_data["HetAtm"],
                 }
                 out_rows.append(new_row)
             except Exception:

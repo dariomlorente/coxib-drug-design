@@ -1,6 +1,6 @@
 """
 Cheminformatics utilities for virtual screening and compound generation.
-Modules: chemistry, dataframes, enamine_api, _resources.
+Modules: chemistry, dataframes, enamine_api, _resources, _stage_cache, _pipeline.
 """
 
 from .chemistry import (
@@ -23,7 +23,23 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-__version__ = "3.17"  # Month.Day
+from ._stage_cache import (
+    StageCache,
+    load_or_compute,
+    save_stage,
+)
+
+from ._pipeline import (
+    stage_path,
+    checkpoint_path,
+    rejected_path,
+    init_stage_dirs,
+    load_or_run,
+    load_or_filter,
+    save_dataframe,
+)
+
+__version__ = "3.18"  # Month.Day
 __author__ = "Dario M Lorente"
 
 __all__ = [
@@ -41,4 +57,16 @@ __all__ = [
     # Enamine API
     "EnamineClient",
     "add_enamine_prices",
+    # Stage Cache
+    "StageCache",
+    "load_or_compute",
+    "save_stage",
+    # Pipeline
+    "stage_path",
+    "checkpoint_path",
+    "rejected_path",
+    "init_stage_dirs",
+    "load_or_run",
+    "load_or_filter",
+    "save_dataframe",
 ]

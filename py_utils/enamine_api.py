@@ -48,7 +48,7 @@ _ENAMINE_EMAIL = os.environ.get("ENAMINE_EMAIL", "")
 _ENAMINE_PASSWORD = os.environ.get("ENAMINE_PASSWORD", "")
 
 # Cache directory
-DEFAULT_CACHE_DIR = "mol_files/2. Building Blocks/price_cache"
+DEFAULT_CACHE_DIR = "mol_files/2. Building Blocks/.cache/price_cache"
 
 
 class EnamineClient:
@@ -481,11 +481,15 @@ def add_enamine_prices(
     final_invalid_cache.update({cid: True for cid in new_invalid_compounds})
 
     # Build price map only for compounds that have valid pricing.
-    # Create a lookup from compound ID to SMILES (avoids parsing ALL rows).
+    # Create id_to_smi dict ONLY for valid IDs (avoid parsing all rows).
     valid_ids = set(compound_ids) & set(final_valid_cache.keys())
+    
+    # Build lookup dict only for valid IDs
+    valid_rows = out_df[out_df[id_col].isin(valid_ids)]
     id_to_smi: dict[str, str] = dict(
-        zip(out_df[id_col].astype(str), out_df[smiles_col].astype(str))
+        zip(valid_rows[id_col].astype(str), valid_rows[smiles_col].astype(str))
     )
+    
     price_map: dict[str, tuple[float, float]] = {}
     for cid in valid_ids:
         pack = final_valid_cache[cid]
