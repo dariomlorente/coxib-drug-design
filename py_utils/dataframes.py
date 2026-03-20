@@ -164,6 +164,8 @@ def _process_descriptors_batch(
                 "MR": Descriptors.MolMR(mol),
                 "CAtm": sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6),
                 "Atoms": mol.GetNumAtoms(),
+                "tPSA": Descriptors.TPSA(mol),
+                "LogP": Descriptors.MolLogP(mol),
             }
             results.append((idx, desc))
         except Exception:
@@ -175,7 +177,7 @@ def add_rdkit_properties(
     df: pd.DataFrame,
     n_workers: int | None = None,
 ) -> pd.DataFrame:
-    """Add RDKit descriptors (MW, HBD, HBA, RotB, HvyAtm, Rings, CAtm, HetAtm, MR, Atoms) to DataFrame.
+    """Add RDKit descriptors (MW, HBD, HBA, RotB, HvyAtm, Rings, CAtm, HetAtm, MR, Atoms, tPSA, LogP) to DataFrame.
     
     Parameters:
         df: Input DataFrame with SMILES column
@@ -228,7 +230,7 @@ def add_rdkit_properties(
     # Add descriptors to DataFrame
     results_dict = {idx: desc for idx, desc in results}
     
-    for col in ["MW", "HBD", "HBA", "RotB", "HvyAtm", "Rings", "HetAtm", "MR", "CAtm", "Atoms"]:
+    for col in ["MW", "HBD", "HBA", "RotB", "HvyAtm", "Rings", "HetAtm", "MR", "CAtm", "Atoms", "tPSA", "LogP"]:
         out[col] = [results_dict.get(idx, {}).get(col, None) for idx in range(len(out))]
     
     return out
@@ -570,6 +572,13 @@ def filter_Veber(
         # Original behavior - return DataFrames in memory
         df_rejected = df_work[any_fail].copy().reset_index(drop=True)
         df_accepted = df_work[~any_fail].drop(columns=["Rejection"]).reset_index(drop=True)
+    
+    # Select only desired columns for rejected (Veber)
+    if len(df_rejected) > 0:
+        # Keep only: ID, SMILES, PriceMol, tPSA, RotB, LogP, MW, HBD, HBA, Rejection
+        desired_cols = ["ID", "SMILES", "PriceMol", "tPSA", "RotB", "LogP", "MW", "HBD", "HBA", "Rejection"]
+        existing_cols = [col for col in desired_cols if col in df_rejected.columns]
+        df_rejected = df_rejected[existing_cols].reset_index(drop=True)
 
     if print_report:
         n_total = len(df)
@@ -767,6 +776,13 @@ def filter_BrenkPAINS(
     df_rejected = pd.concat([brenk_rejected, pains_rejected], ignore_index=True)
     df_accepted = pains_accepted.drop(columns=["MatchAlert", "Substructure"]).reset_index(drop=True)
     df_rejected = df_rejected.reset_index(drop=True)
+    
+    # Select only desired columns for rejected (Brenk+PAINS)
+    if len(df_rejected) > 0:
+        # Keep only: ID, SMILES, PriceMol, tPSA, RotB, LogP, MW, HBD, HBA, MatchAlert, Substructure
+        desired_cols = ["ID", "SMILES", "PriceMol", "tPSA", "RotB", "LogP", "MW", "HBD", "HBA", "MatchAlert", "Substructure"]
+        existing_cols = [col for col in desired_cols if col in df_rejected.columns]
+        df_rejected = df_rejected[existing_cols].reset_index(drop=True)
 
     if print_report:
         n_total = len(df)

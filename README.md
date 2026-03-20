@@ -38,14 +38,48 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 | Path | Description |
 |------|-------------|
 | `py_utils/` | Python package: reactions, filters, I/O, pricing client |
+| `py_utils/_checkpoint.py` | Checkpoint management for robust resume support |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization |
 | `03_activity_prediction.ipynb` | Phase 3: *In silico* activity prediction |
 | `env.yaml` | Conda environment specification |
 
+## File Naming Convention
+
+All output files include row counts for clarity and easy identification:
+
+| Stage | Pattern | Example |
+|-------|---------|---------|
+| **Reaction (raw)** | `{Stage}_raw.csv` | `Imidazolones_raw.csv` |
+| **Reaction checkpoint** | `{Stage}_checkpoint.json` | `Oxazolones_checkpoint.json` |
+| **Filtered / Final** | `{Stage}_{N}cmpds.csv` | `Imidazolones_118151cmpds.csv` |
+
+**Example file structure:**
+```
+mol_files/4. Imidazolones/
+  Imidazolones_raw.csv              # A-G reaction output
+  Imidazolones_118151cmpds.csv      # Final export (all products)
+  .rejected/
+  .cache/
+```
+
+## Checkpoint System
+
+The pipeline now uses a robust checkpoint system for crash recovery:
+
+- **Reaction outputs**: `{Stage}_raw.csv` + `{Stage}_checkpoint.json`
+- **Filter outputs**: `{Stage}_{N}cmpds.csv` (row count in filename)
+- **Final exports**: `{Stage}_{N}cmpds.csv` (row count in filename)
+
+If the kernel crashes, re-running the notebook will:
+1. Detect the checkpoint JSON
+2. Skip already-processed aldehydes/oxazolones
+3. Resume from the last completed chunk
+4. Continue until completion
+
 ## Author
 
-Dario M. Lorente — University of Zaragoza
-[840629@unizar.es](mailto:840629@unizar.es)
+Darío M. Lorente — University of Zaragoza  
+[840629@unizar.es](mailto:840629@unizar.es)  
 [dariomlorente@gmail.com](mailto:dariomlorente@gmail.com)

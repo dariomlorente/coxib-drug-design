@@ -96,9 +96,10 @@ def rxn_ErlenmeyerPlochl(
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     n_workers: int | None = None,
-    chunk_size: int = 50,
+    chunk_size: int = 25,  # Reduced from 50 for safer checkpointing
     output_csv: str | Path | None = None,
     checkpoint_csv: str | Path | None = None,
+    checkpoint_manager: Any = None,
 ) -> pd.DataFrame:
     """
     Erlenmeyer-Plöchl reaction: combines aldehydes with carboxylic acids
@@ -107,8 +108,7 @@ def rxn_ErlenmeyerPlochl(
     Uses chunked streaming to limit memory usage - processes aldehydes in
     batches of `chunk_size`, writing intermediate results to disk.
 
-    Supports checkpoint-based resume: if checkpoint_csv exists, skips already-processed
-    aldehyde IDs on restart.
+    Supports robust checkpoint-based resume using CheckpointManager.
 
     Parameters:
         df_aldehyde: DataFrame with aldehyde compounds.
@@ -122,15 +122,24 @@ def rxn_ErlenmeyerPlochl(
         use_cache: Use persistent cache (default: True).
         cache_file: Cache file path (default: auto-generated).
         n_workers: Number of parallel workers (default: cpu_count - 1).
-        chunk_size: Number of aldehydes per chunk (default: 50).
+        chunk_size: Number of aldehydes per chunk (default: 25, reduced for safety).
         output_csv: If provided, write final result to this CSV file.
             Skips in-memory deduplication for large datasets.
-        checkpoint_csv: If provided, use this file for checkpoint-based resume.
+        checkpoint_csv: Legacy parameter (ignored if checkpoint_manager provided).
+        checkpoint_manager: CheckpointManager instance for robust resume support.
 
     Returns:
         DataFrame with oxazolone products. If output_csv is provided, the
         returned DataFrame may be loaded from the CSV file.
     """
+    # Import CheckpointManager here to avoid circular imports
+    from ._checkpoint import CheckpointManager
+    
+    # Setup checkpoint manager
+    if checkpoint_manager is None and output_csv is not None:
+        output_path = Path(output_csv)
+        stage_name = "Oxazolones"
+        checkpoint_manager = CheckpointManager(stage_name, output_path.parent)
     # Validate inputs
     for df, name, id_col in [(df_aldehyde, "aldehyde", id_col_aldehyde),
                               (df_carboxylic, "carboxylic", id_col_carboxyl)]:
@@ -227,39 +236,66 @@ def rxn_ErlenmeyerPlochl(
         temp_csv_path = cache_file.parent / ".tmp_ep_results.csv"
     temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Check for existing checkpoint to resume from
+    # Check for existing checkpoint to resume from using CheckpointManager
     completed_ald_ids: set[str] = set()
     is_resuming = False
-    if temp_csv_path.exists():
+    total_chunks = (len(valid_aldehydes) + chunk_size - 1) // chunk_size
+    
+    if checkpoint_manager is not None:
+        # Get completed IDs from checkpoint manager
+        completed_ald_ids = checkpoint_manager.get_completed_ids("aldehyde")
+        if len(completed_ald_ids) > 0:
+            is_resuming = True
+            if print_report:
+                print(f"[ErlenmeyerPlochl] Resuming from checkpoint: "
+                      f"{len(completed_ald_ids):,} aldehydes already processed")
+
+    # Also check for old-style CSV checkpoint for backward compatibility
+    if not is_resuming and temp_csv_path.exists():
         try:
             checkpoint_df = pd.read_csv(temp_csv_path)
             if "ID" in checkpoint_df.columns:
-                # E-P IDs are like A{num}C{num}, extract aldehyde ID prefix
                 completed_ald_ids = set(
                     id_str.rsplit("C", 1)[0] for id_str in checkpoint_df["ID"].unique()
                     if "C" in id_str
                 )
                 is_resuming = True
                 if print_report:
-                    print(f"[ErlenmeyerPlochl] Resuming from checkpoint: "
+                    print(f"[ErlenmeyerPlochl] Resuming from CSV checkpoint: "
                           f"{len(completed_ald_ids):,} aldehydes already processed")
-        except Exception:
-            pass
+                # Import checkpoint manager if not already available
+                if checkpoint_manager is None:
+                    from ._checkpoint import CheckpointManager
+                    output_path = Path(output_csv) if output_csv else cache_file.parent
+                    stage_name = "Oxazolones"
+                    checkpoint_manager = CheckpointManager(stage_name, output_path.parent)
+                # Sync completed IDs to new checkpoint system
+                if completed_ald_ids:
+                    checkpoint_manager.add_completed_ids("aldehyde", completed_ald_ids)
+        except Exception as e:
+            if print_report:
+                print(f"[ErlenmeyerPlochl] Warning: Could not read CSV checkpoint: {e}")
 
     # Filter to skip already-processed aldehydes
-    if is_resuming:
+    if is_resuming and completed_ald_ids:
+        original_count = len(valid_aldehydes)
         valid_aldehydes = [
             (smi, ald_id, price) for smi, ald_id, price in valid_aldehydes
             if ald_id not in completed_ald_ids
         ]
         if print_report:
-            print(f"[ErlenmeyerPlochl] Processing {len(valid_aldehydes):,} remaining aldehydes")
+            print(f"[ErlenmeyerPlochl] Skipping {original_count - len(valid_aldehydes):,} completed aldehydes, "
+                  f"processing {len(valid_aldehydes):,} remaining")
 
     cache_hits = 0
     cache_misses = 0
     
+    # Update checkpoint with progress info
+    if checkpoint_manager is not None:
+        checkpoint_manager.update_progress(total_chunks=total_chunks)
+
     # Chunked processing loop
-    n_chunks = (len(valid_aldehydes) + chunk_size - 1) // chunk_size
+    n_chunks = (len(valid_aldehydes) + chunk_size - 1) // chunk_size if valid_aldehydes else 0
     
     for chunk_idx in range(n_chunks):
         chunk_start = chunk_idx * chunk_size
@@ -290,13 +326,18 @@ def rxn_ErlenmeyerPlochl(
                                 "ID": f"A{ald_num}C{carb_num}",
                                 "SMILES": prod_data["smiles"],
                                 "PriceMol": price_total,
-                                "MW": prod_data["MW"],
-                                "HBA": prod_data["HBA"],
-                                "HBD": prod_data["HBD"],
+                                "tPSA": prod_data["tPSA"],
                                 "RotB": prod_data["RotB"],
+                                "LogP": prod_data["LogP"],
+                                "MW": prod_data["MW"],
+                                "HBD": prod_data["HBD"],
+                                "HBA": prod_data["HBA"],
+                                "MR": prod_data["MR"],
                                 "HvyAtm": prod_data["HvyAtm"],
                                 "Rings": prod_data["Rings"],
+                                "CAtm": prod_data["CAtm"],
                                 "HetAtm": prod_data["HetAtm"],
+                                "Atoms": prod_data["Atoms"],
                             })
                     cache_hits += 1
                 else:
@@ -344,6 +385,15 @@ def rxn_ErlenmeyerPlochl(
         # Flush chunk results to temp CSV
         _append_to_temp_csv(out_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0))
         
+        # Update checkpoint with completed aldehyde IDs
+        if checkpoint_manager is not None and chunk_aldehydes:
+            chunk_ald_ids = {ald_id for (_, ald_id, _) in chunk_aldehydes}
+            checkpoint_manager.add_completed_ids("aldehyde", chunk_ald_ids)
+            checkpoint_manager.update_progress(
+                completed_chunks=chunk_idx + 1,
+                last_chunk_time=0.0  # Could add timing if needed
+            )
+        
         # Flush cache incrementally
         if use_cache and new_cache_entries:
             cache.update(new_cache_entries)
@@ -373,6 +423,12 @@ def rxn_ErlenmeyerPlochl(
     stats["output_rows"] = len(out_df)
     stats["cache_hits"] = cache_hits
     stats["cache_misses"] = cache_misses
+
+    # Update checkpoint with final stats
+    if checkpoint_manager is not None:
+        checkpoint_manager.set_complete(row_count=len(out_df), stats=stats)
+        if print_report:
+            print(f"[ErlenmeyerPlochl] Checkpoint saved: {checkpoint_manager.path.name}")
 
     if print_report:
         if use_cache:
@@ -447,6 +503,11 @@ def _process_ep_batch(
                     "HvyAtm": prod_mol.GetNumHeavyAtoms(),
                     "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
                     "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                    "tPSA": Descriptors.TPSA(prod_mol),
+                    "LogP": Descriptors.MolLogP(prod_mol),
+                    "MR": Descriptors.MolMR(prod_mol),
+                    "CAtm": prod_mol.GetNumAtoms() - rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                    "Atoms": prod_mol.GetNumAtoms(),
                 }
                 product_data_list.append(prod_data)
 
@@ -456,13 +517,18 @@ def _process_ep_batch(
                     "ID": f"A{ald_num}C{carb_num}",
                     "SMILES": psmi,
                     "PriceMol": price_total,
-                    "MW": prod_data["MW"],
-                    "HBA": prod_data["HBA"],
-                    "HBD": prod_data["HBD"],
+                    "tPSA": prod_data["tPSA"],
                     "RotB": prod_data["RotB"],
+                    "LogP": prod_data["LogP"],
+                    "MW": prod_data["MW"],
+                    "HBD": prod_data["HBD"],
+                    "HBA": prod_data["HBA"],
+                    "MR": prod_data["MR"],
                     "HvyAtm": prod_data["HvyAtm"],
                     "Rings": prod_data["Rings"],
+                    "CAtm": prod_data["CAtm"],
                     "HetAtm": prod_data["HetAtm"],
+                    "Atoms": prod_data["Atoms"],
                 }
                 if keep_mol:
                     new_row["Mol"] = prod_mol
@@ -487,9 +553,10 @@ def rxn_AminolysisGFPc(
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     n_workers: int | None = None,
-    chunk_size: int = 500,
+    chunk_size: int = 100,  # Reduced from 500 for safer checkpointing
     output_csv: str | Path | None = None,
     checkpoint_csv: str | Path | None = None,
+    checkpoint_manager: Any = None,
 ) -> pd.DataFrame:
     """
     Aminolysis-GFPc reaction: opens oxazolone rings with amines to form imidazolones.
@@ -497,8 +564,7 @@ def rxn_AminolysisGFPc(
     Uses chunked streaming to limit memory usage - processes oxazolones in
     batches of `chunk_size`, writing intermediate results to disk.
 
-    Supports checkpoint-based resume: if checkpoint_csv exists, skips already-processed
-    oxazolone IDs on restart.
+    Supports robust checkpoint-based resume using CheckpointManager.
 
     Parameters:
         df_oxazolones: DataFrame with oxazolone compounds.
@@ -619,38 +685,65 @@ def rxn_AminolysisGFPc(
         temp_csv_path = cache_file.parent / ".tmp_ag_results.csv"
     temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Check for existing checkpoint to resume from
+    # Import CheckpointManager here to avoid circular imports
+    from ._checkpoint import CheckpointManager
+    
+    # Setup checkpoint manager
+    if checkpoint_manager is None and output_csv is not None:
+        output_path = Path(output_csv)
+        stage_name = "Imidazolones"
+        checkpoint_manager = CheckpointManager(stage_name, output_path.parent)
+    
+    # Check for existing checkpoint to resume from using CheckpointManager
     completed_ox_ids: set[str] = set()
     is_resuming = False
-    if temp_csv_path.exists():
+    total_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size if valid_oxazolones else 0
+    
+    if checkpoint_manager is not None:
+        completed_ox_ids = checkpoint_manager.get_completed_ids("oxazolone")
+        if len(completed_ox_ids) > 0:
+            is_resuming = True
+            if print_report:
+                print(f"[AminolysisGFPc] Resuming from checkpoint: "
+                      f"{len(completed_ox_ids):,} oxazolones already processed")
+
+    # Also check for old-style CSV checkpoint for backward compatibility
+    if not is_resuming and temp_csv_path.exists():
         try:
             checkpoint_df = pd.read_csv(temp_csv_path)
             if "ID" in checkpoint_df.columns:
                 completed_ox_ids = set(checkpoint_df["ID"].str.replace(r"N\d+$", "", regex=True).unique())
                 is_resuming = True
                 if print_report:
-                    print(f"[AminolysisGFPc] Resuming from checkpoint: "
+                    print(f"[AminolysisGFPc] Resuming from CSV checkpoint: "
                           f"{len(completed_ox_ids):,} oxazolones already processed")
-        except Exception:
-            pass
+                # Sync to new checkpoint manager
+                if completed_ox_ids and checkpoint_manager is not None:
+                    checkpoint_manager.add_completed_ids("oxazolone", completed_ox_ids)
+        except Exception as e:
+            if print_report:
+                print(f"[AminolysisGFPc] Warning: Could not read CSV checkpoint: {e}")
     
     cache_hits = 0
     cache_misses = 0
     
-    # Chunked processing loop
-    n_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size
-    
     # Filter valid_oxazolones to skip already-processed ones
-    if is_resuming:
-        valid_oxazolones_filtered = [
+    if is_resuming and completed_ox_ids:
+        original_count = len(valid_oxazolones)
+        valid_oxazolones = [
             (smi, ox_id, price) for smi, ox_id, price in valid_oxazolones
             if ox_id not in completed_ox_ids
         ]
         if print_report:
-            print(f"[AminolysisGFPc] Skipping {len(completed_ox_ids):,} completed oxazolones, "
-                  f"processing {len(valid_oxazolones_filtered):,} remaining")
-        valid_oxazolones = valid_oxazolones_filtered
-        n_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size
+            print(f"[AminolysisGFPc] Skipping {original_count - len(valid_oxazolones):,} completed oxazolones, "
+                  f"processing {len(valid_oxazolones):,} remaining")
+    
+    # Update checkpoint with progress info
+    if checkpoint_manager is not None:
+        checkpoint_manager.update_progress(total_chunks=total_chunks)
+    
+    # Chunked processing loop
+    n_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size if valid_oxazolones else 0
     
     for chunk_idx in range(n_chunks):
         chunk_start = chunk_idx * chunk_size
@@ -685,13 +778,18 @@ def rxn_AminolysisGFPc(
                                 "ID": f"{ox_id}N{am_num}",
                                 "SMILES": prod_data["smiles"],
                                 "PriceMol": price_total,
-                                "MW": prod_data["MW"],
-                                "HBA": prod_data["HBA"],
-                                "HBD": prod_data["HBD"],
+                                "tPSA": prod_data["tPSA"],
                                 "RotB": prod_data["RotB"],
+                                "LogP": prod_data["LogP"],
+                                "MW": prod_data["MW"],
+                                "HBD": prod_data["HBD"],
+                                "HBA": prod_data["HBA"],
+                                "MR": prod_data["MR"],
                                 "HvyAtm": prod_data["HvyAtm"],
                                 "Rings": prod_data["Rings"],
+                                "CAtm": prod_data["CAtm"],
                                 "HetAtm": prod_data["HetAtm"],
+                                "Atoms": prod_data["Atoms"],
                             })
                     cache_hits += 1
                 else:
@@ -738,10 +836,19 @@ def rxn_AminolysisGFPc(
         # Flush chunk results to temp CSV
         _append_to_temp_csv(out_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0))
         
-        # Flush cache every 500 chunks (not every chunk) to reduce disk I/O
+        # Update checkpoint with completed oxazolone IDs
+        if checkpoint_manager is not None and chunk_oxazolones:
+            chunk_ox_ids = {ox_id for (_, ox_id, _) in chunk_oxazolones}
+            checkpoint_manager.add_completed_ids("oxazolone", chunk_ox_ids)
+            checkpoint_manager.update_progress(
+                completed_chunks=chunk_idx + 1,
+                last_chunk_time=0.0
+            )
+        
+        # Flush cache every 50 chunks (not every chunk) to reduce disk I/O
         if use_cache and new_cache_entries:
             cache.update(new_cache_entries)
-            if (chunk_idx + 1) % 500 == 0:
+            if (chunk_idx + 1) % 50 == 0:
                 _save_cache(cache_file, cache)
     
     # Save final cache after all chunks complete
@@ -774,6 +881,12 @@ def rxn_AminolysisGFPc(
     stats["output_rows"] = len(out_df)
     stats["cache_hits"] = cache_hits
     stats["cache_misses"] = cache_misses
+
+    # Update checkpoint with final stats
+    if checkpoint_manager is not None:
+        checkpoint_manager.set_complete(row_count=len(out_df), stats=stats)
+        if print_report:
+            print(f"[AminolysisGFPc] Checkpoint saved: {checkpoint_manager.path.name}")
 
     if print_report:
         if use_cache:
@@ -851,6 +964,11 @@ def _process_ag_batch(
                     "HvyAtm": prod_mol.GetNumHeavyAtoms(),
                     "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
                     "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                    "tPSA": Descriptors.TPSA(prod_mol),
+                    "LogP": Descriptors.MolLogP(prod_mol),
+                    "MR": Descriptors.MolMR(prod_mol),
+                    "CAtm": prod_mol.GetNumAtoms() - rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                    "Atoms": prod_mol.GetNumAtoms(),
                 }
                 product_data_list.append(prod_data)
 
@@ -859,13 +977,18 @@ def _process_ag_batch(
                     "ID": f"{ox_id}N{am_num}",
                     "SMILES": psmi,
                     "PriceMol": price_total,
-                    "MW": prod_data["MW"],
-                    "HBA": prod_data["HBA"],
-                    "HBD": prod_data["HBD"],
+                    "tPSA": prod_data["tPSA"],
                     "RotB": prod_data["RotB"],
+                    "LogP": prod_data["LogP"],
+                    "MW": prod_data["MW"],
+                    "HBD": prod_data["HBD"],
+                    "HBA": prod_data["HBA"],
+                    "MR": prod_data["MR"],
                     "HvyAtm": prod_data["HvyAtm"],
                     "Rings": prod_data["Rings"],
+                    "CAtm": prod_data["CAtm"],
                     "HetAtm": prod_data["HetAtm"],
+                    "Atoms": prod_data["Atoms"],
                 }
                 if keep_mol:
                     new_row["Mol"] = prod_mol
@@ -889,12 +1012,13 @@ def rxn_SulphurExchange(
     print_report: bool = True,
     output_csv: str | Path | None = None,
     checkpoint_csv: str | Path | None = None,
-    chunk_size: int = 5000,
+    chunk_size: int = 1000,  # Reduced from 5000 for safer checkpointing
+    checkpoint_manager: Any = None,
 ) -> pd.DataFrame:
     """
     Sulphur-Exchange reaction: converts oxazolones to thiazolones by replacing oxygen with sulphur.
 
-    Uses chunked processing for large datasets to enable checkpoint-based resume.
+    Uses chunked processing for large datasets with robust checkpoint-based resume.
 
     Parameters:
         df_oxazolones: DataFrame with oxazolone compounds.
@@ -906,9 +1030,9 @@ def rxn_SulphurExchange(
         cache_file: Cache file path (default: auto-generated).
         print_report: Print statistics (default: True).
         output_csv: If provided, write final result to this CSV file.
-        checkpoint_csv: If provided, use this file for checkpoint-based resume.
-            Results are appended to this file after each chunk.
-        chunk_size: Number of oxazolones per chunk for checkpointing (default: 5000).
+        checkpoint_csv: Legacy parameter (ignored if checkpoint_manager provided).
+        chunk_size: Number of oxazolones per chunk for checkpointing (default: 1000).
+        checkpoint_manager: CheckpointManager instance for robust resume support.
 
     Returns:
         DataFrame with thiazolone products.
@@ -982,16 +1106,37 @@ def rxn_SulphurExchange(
     stats["invalid_oxazolone"] = int((~ox_valid).sum())
     stats["not_oxazolone"] = int((ox_valid & ~ox_match).sum())
 
-    # Check for existing checkpoint to resume from
+    # Setup temp file for streaming results
     if checkpoint_csv is not None:
         temp_csv_path = Path(checkpoint_csv)
     else:
         temp_csv_path = cache_file.parent / ".tmp_se_results.csv"
     temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Import CheckpointManager here to avoid circular imports
+    from ._checkpoint import CheckpointManager
+    
+    # Setup checkpoint manager
+    if checkpoint_manager is None and output_csv is not None:
+        output_path = Path(output_csv)
+        stage_name = "Thiazolones"
+        checkpoint_manager = CheckpointManager(stage_name, output_path.parent)
+
+    # Check for existing checkpoint to resume from using CheckpointManager
     completed_ox_ids: set[str] = set()
     is_resuming = False
-    if temp_csv_path.exists():
+    total_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size if valid_oxazolones else 0
+    
+    if checkpoint_manager is not None:
+        completed_ox_ids = checkpoint_manager.get_completed_ids("oxazolone")
+        if len(completed_ox_ids) > 0:
+            is_resuming = True
+            if print_report:
+                print(f"[SulphurExchange] Resuming from checkpoint: "
+                      f"{len(completed_ox_ids):,} oxazolones already processed")
+
+    # Also check for old-style CSV checkpoint for backward compatibility
+    if not is_resuming and temp_csv_path.exists():
         try:
             checkpoint_df = pd.read_csv(temp_csv_path)
             if "ID" in checkpoint_df.columns:
@@ -999,19 +1144,29 @@ def rxn_SulphurExchange(
                 completed_ox_ids = set(checkpoint_df["ID"].str.rstrip("S").unique())
                 is_resuming = True
                 if print_report:
-                    print(f"[SulphurExchange] Resuming from checkpoint: "
+                    print(f"[SulphurExchange] Resuming from CSV checkpoint: "
                           f"{len(completed_ox_ids):,} oxazolones already processed")
-        except Exception:
-            pass
+                # Sync to new checkpoint manager
+                if completed_ox_ids and checkpoint_manager is not None:
+                    checkpoint_manager.add_completed_ids("oxazolone", completed_ox_ids)
+        except Exception as e:
+            if print_report:
+                print(f"[SulphurExchange] Warning: Could not read CSV checkpoint: {e}")
 
     # Filter to skip already-processed oxazolones
-    if is_resuming:
+    if is_resuming and completed_ox_ids:
+        original_count = len(valid_oxazolones)
         valid_oxazolones = [
             (smi, ox_id, price) for smi, ox_id, price in valid_oxazolones
             if ox_id not in completed_ox_ids
         ]
         if print_report:
-            print(f"[SulphurExchange] Processing {len(valid_oxazolones):,} remaining oxazolones")
+            print(f"[SulphurExchange] Skipping {original_count - len(valid_oxazolones):,} completed oxazolones, "
+                  f"processing {len(valid_oxazolones):,} remaining")
+
+    # Update checkpoint with progress info
+    if checkpoint_manager is not None:
+        checkpoint_manager.update_progress(total_chunks=total_chunks)
 
     # Cache check
     out_rows: list[dict] = []
@@ -1029,13 +1184,18 @@ def rxn_SulphurExchange(
                         "ID": f"{ox_id}S",
                         "SMILES": prod_data["smiles"],
                         "PriceMol": price_total,
-                        "MW": prod_data["MW"],
-                        "HBA": prod_data["HBA"],
-                        "HBD": prod_data["HBD"],
+                        "tPSA": prod_data["tPSA"],
                         "RotB": prod_data["RotB"],
+                        "LogP": prod_data["LogP"],
+                        "MW": prod_data["MW"],
+                        "HBD": prod_data["HBD"],
+                        "HBA": prod_data["HBA"],
+                        "MR": prod_data["MR"],
                         "HvyAtm": prod_data["HvyAtm"],
                         "Rings": prod_data["Rings"],
+                        "CAtm": prod_data["CAtm"],
                         "HetAtm": prod_data["HetAtm"],
+                        "Atoms": prod_data["Atoms"],
                     })
             cache_hits += 1
         else:
@@ -1096,6 +1256,15 @@ def rxn_SulphurExchange(
             out_rows.extend(chunk_rows)
             _append_to_temp_csv(chunk_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0 and not is_resuming))
 
+        # Update checkpoint with completed oxazolone IDs
+        if checkpoint_manager is not None and chunk_items:
+            chunk_ox_ids = {valid_oxazolones[i][1] for i in chunk_items}
+            checkpoint_manager.add_completed_ids("oxazolone", chunk_ox_ids)
+            checkpoint_manager.update_progress(
+                completed_chunks=chunk_idx + 1,
+                last_chunk_time=0.0
+            )
+
         # Save cache periodically
         if use_cache and new_cache_entries and (chunk_idx + 1) % 100 == 0:
             cache.update(new_cache_entries)
@@ -1105,6 +1274,12 @@ def rxn_SulphurExchange(
     if use_cache and new_cache_entries:
         cache.update(new_cache_entries)
         _save_cache(cache_file, cache)
+
+    # Update checkpoint with final stats
+    if checkpoint_manager is not None:
+        checkpoint_manager.set_complete(row_count=len(out_rows), stats=stats)
+        if print_report:
+            print(f"[SulphurExchange] Checkpoint saved: {checkpoint_manager.path.name}")
 
     out_df = pd.DataFrame(out_rows)
     
@@ -1124,6 +1299,10 @@ def rxn_SulphurExchange(
     stats["output_rows"] = len(out_df)
     stats["cache_hits"] = cache_hits
     stats["cache_misses"] = cache_misses
+
+    # Update checkpoint with final stats (if not already set)
+    if checkpoint_manager is not None:
+        checkpoint_manager.set_complete(row_count=len(out_df), stats=stats)
 
     if print_report:
         if use_cache:
@@ -1197,6 +1376,11 @@ def _process_se_batch(
                     "HvyAtm": prod_mol.GetNumHeavyAtoms(),
                     "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
                     "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                    "tPSA": Descriptors.TPSA(prod_mol),
+                    "LogP": Descriptors.MolLogP(prod_mol),
+                    "MR": Descriptors.MolMR(prod_mol),
+                    "CAtm": prod_mol.GetNumAtoms() - rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
+                    "Atoms": prod_mol.GetNumAtoms(),
                 }
                 product_data_list.append(prod_data)
 
@@ -1205,13 +1389,18 @@ def _process_se_batch(
                     "ID": f"{ox_id}S",
                     "SMILES": psmi,
                     "PriceMol": ox_price + thioacetic_price_eq,
-                    "MW": prod_data["MW"],
-                    "HBA": prod_data["HBA"],
-                    "HBD": prod_data["HBD"],
+                    "tPSA": prod_data["tPSA"],
                     "RotB": prod_data["RotB"],
+                    "LogP": prod_data["LogP"],
+                    "MW": prod_data["MW"],
+                    "HBD": prod_data["HBD"],
+                    "HBA": prod_data["HBA"],
+                    "MR": prod_data["MR"],
                     "HvyAtm": prod_data["HvyAtm"],
                     "Rings": prod_data["Rings"],
+                    "CAtm": prod_data["CAtm"],
                     "HetAtm": prod_data["HetAtm"],
+                    "Atoms": prod_data["Atoms"],
                 }
                 out_rows.append(new_row)
             except Exception:
