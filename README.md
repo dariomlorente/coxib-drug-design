@@ -51,30 +51,34 @@ All output files include row counts for clarity and easy identification:
 
 | Stage | Pattern | Example |
 |-------|---------|---------|
-| **Reaction (raw)** | `{Stage}_raw.csv` | `Imidazolones_raw.csv` |
-| **Reaction checkpoint** | `{Stage}_checkpoint.json` | `Oxazolones_checkpoint.json` |
-| **Filtered / Final** | `{Stage}_{N}cmpds.csv` | `Imidazolones_118151cmpds.csv` |
+| **Reaction (raw)** | `{Stage}_raw_{N}cmpds.csv` | `Imidazolones_raw_858270cmpds.csv` |
+| **Reaction checkpoint** | `.cache/{Stage}_checkpoint.json` | `mol_files/3. Oxazolones/.cache/Oxazolones_checkpoint.json` |
+| **Veber filter** | `{Stage}_veber_{N}cmpds.csv` | `Oxazolones_veber_4087cmpds.csv` |
+| **Brenk+PAINS filter** | `{Stage}_brenkpains_{N}cmpds.csv` | `Imidazolones_brenkpains_118151cmpds.csv` |
 
 **Example file structure:**
 ```
 mol_files/4. Imidazolones/
-  Imidazolones_raw.csv              # A-G reaction output
-  Imidazolones_118151cmpds.csv      # Final export (all products)
-  .rejected/
+  Imidazolones_raw_858270cmpds.csv        # A-G reaction output
+  Imidazolones_veber_162291cmpds.csv      # After Veber filter
+  Imidazolones_brenkpains_118151cmpds.csv # Final export (Brenk+PAINS)
   .cache/
+    Imidazolones_checkpoint.json          # Resume metadata
+  .rejected/
 ```
 
 ## Checkpoint System
 
 The pipeline now uses a robust checkpoint system for crash recovery:
 
-- **Reaction outputs**: `{Stage}_raw.csv` + `{Stage}_checkpoint.json`
-- **Filter outputs**: `{Stage}_{N}cmpds.csv` (row count in filename)
-- **Final exports**: `{Stage}_{N}cmpds.csv` (row count in filename)
+- **Reaction outputs**: `{Stage}_raw_{N}cmpds.csv` (row count in filename)
+- **Checkpoints**: `.cache/{Stage}_checkpoint.json` (metadata in `.cache/`)
+- **Filter outputs**: `{Stage}_{filter}_{N}cmpds.csv` (row count + filter suffix)
+- **Final exports**: `{Stage}_brenkpains_{N}cmpds.csv` (row count + filter suffix)
 
 If the kernel crashes, re-running the notebook will:
-1. Detect the checkpoint JSON
-2. Skip already-processed aldehydes/oxazolones
+1. Detect the checkpoint JSON in `.cache/`
+2. Skip already-processed aldehydes/oxazolones (tracked by IDs)
 3. Resume from the last completed chunk
 4. Continue until completion
 

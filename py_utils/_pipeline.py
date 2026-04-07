@@ -221,6 +221,12 @@ def load_or_run(
         
         For raw outputs: {Stage}_raw_{N}cmpds.csv or {Stage}_raw.csv
         For filtered outputs: {Stage}_{filter}_{N}cmpds.csv
+        For custom names: {Stage}_{N}cmpds.csv or {Stage}_{suffix}_{N}cmpds.csv
+        
+        When multiple matches exist, prefers files based on specificity and recency:
+        1. Exact match {Stage}_{N}cmpds.csv (no extra segments)
+        2. Match with suffix {Stage}_{suffix}_{N}cmpds.csv (one extra segment)
+        3. Most recently modified file
         """
         import re
         
@@ -228,16 +234,57 @@ def load_or_run(
         if stage_type == "raw":
             # Look for raw files with row count: {Stage}_raw_*cmpds.csv
             pattern = f"{stage_name}_raw_*cmpds.csv"
-            for f in base_dir.glob(pattern):
-                return f
+            matches = list(base_dir.glob(pattern))
+            if matches:
+                return max(matches, key=lambda p: p.stat().st_mtime)
             # Fallback to raw without count
             return base_dir / f"{stage_name}_raw.csv"
-        else:
+        elif stage_type:
             # For filtered outputs, pattern includes filter name
             pattern = f"{stage_name}_{stage_type}_*cmpds.csv"
-            for f in base_dir.glob(pattern):
-                return f
+            matches = list(base_dir.glob(pattern))
+            if matches:
+                return max(matches, key=lambda p: p.stat().st_mtime)
             return base_dir / f"{stage_name}_{stage_type}.csv"
+        else:
+            # For custom names (like DiagTest_resume), be more specific
+            # Pattern: {stage_name}_*cmpds.csv (matches any row count suffix)
+            exact_pattern = f"{stage_name}_*cmpds.csv"
+            matches = list(base_dir.glob(exact_pattern))
+            
+            if matches:
+                # Filter to only files where stage_name is the FIRST segment
+                # and there are no intermediate underscores before the row count
+                # Example: "DiagTest_resume_953000cmpds.csv" ✓ (resume is suffix)
+                # Example: "DiagTest_raw_1000_raw_4765000cmpds.csv" ✗ (raw_1000_raw is not suffix)
+                def is_direct_match(p: Path) -> bool:
+                    stem = p.stem
+                    # Check if stem matches pattern: stage_name_single_word_or_N(cmpds)
+                    # e.g., "DiagTest_resume_953000" or "DiagTest_12345"
+                    after_prefix = stem[len(stage_name) + 1:]  # +1 for underscore
+                    if not after_prefix:
+                        return False
+                    # Count underscores in the remainder
+                    # Good: "resume_953000" (1 underscore) or "12345" (0 underscores)
+                    # Bad: "raw_1000_raw_4765000" (3 underscores - too many segments)
+                    underscore_count = after_prefix.count("_")
+                    return underscore_count <= 1  # Allow at most one extra segment
+                
+                direct_matches = [m for m in matches if is_direct_match(m)]
+                if direct_matches:
+                    # Return most recent direct match
+                    return max(direct_matches, key=lambda p: p.stat().st_mtime)
+                # If no direct matches, fall back to most recent among all matches
+                return max(matches, key=lambda p: p.stat().st_mtime)
+            
+            # Fallback: search for any file containing the stage name with row count
+            pattern = f"*{stage_name}*_cmpds.csv"
+            matches = list(base_dir.glob(pattern))
+            if matches:
+                return max(matches, key=lambda p: p.stat().st_mtime)
+            
+            # Last fallback: just the stage_name.csv
+            return base_dir / f"{stage_name}.csv"
     
     # Determine what type of output this is
     stage_type = "raw" if "_raw" in output_path.stem else ""
@@ -249,6 +296,10 @@ def load_or_run(
     
     # Check if actual output file exists (with or without row count)
     actual_output = find_actual_output(base_dir, stage_name, stage_type)
+    
+    # If force_recompute, reset checkpoint at the start to avoid stale state
+    if force_recompute:
+        checkpoint.reset()
     
     if not force_recompute and actual_output.exists():
         rows = _get_csv_row_count(actual_output)
@@ -334,6 +385,69 @@ def load_or_run(
         raise
 
 
+def _find_existing_filter_csv(accepted_path: Path, rejected_path: Path) -> tuple[Path | None, Path | None]:
+    """
+    Find existing CSV files for filters, accounting for row count in filename.
+    
+    Search pattern: {stage}_{filter_type}_{N}cmpds.csv
+    
+    Args:
+        accepted_path: Expected path to accepted compounds (without row count)
+        rejected_path: Expected path to rejected compounds (without row count)
+    
+    Returns:
+        Tuple of (found_accepted_path, found_rejected_path) or (None, None) if not found
+    """
+    import re
+    
+    # Try exact paths first
+    if accepted_path.exists() and rejected_path.exists():
+        return accepted_path, rejected_path
+    
+    # Extract stage name and filter type from the expected path pattern
+    # Pattern: {stage}_{filter_type}.csv
+    pattern = r"^([A-Za-z]+)_(\w+)\.csv$"
+    match = re.match(pattern, accepted_path.name)
+    
+    if not match:
+        return None, None
+    
+    stage_name = match.group(1)
+    filter_type = match.group(2)
+    
+    # Search for files with row count pattern: {stage}_{filter_type}_{N}cmpds.csv
+    # Must match stage prefix to avoid cross-stage collisions (e.g., Amines vs Aldehydes)
+    accepted_matches = list(accepted_path.parent.glob(f"{stage_name}_{filter_type}_*cmpds.csv"))
+    
+    if not accepted_matches:
+        # Also try with test_ prefix
+        accepted_matches = list(accepted_path.parent.glob(f"test_{stage_name}_{filter_type}_*cmpds.csv"))
+    
+    if not accepted_matches:
+        return None, None
+    
+    # Use the first match (there should be only one for a given stage + filter)
+    found_accepted = accepted_matches[0]
+    
+    # Now find the corresponding rejected file
+    # rejected_path is in .rejected/ subfolder
+    rejected_parent = rejected_path.parent
+    rejected_parent.mkdir(parents=True, exist_ok=True)
+    
+    # Pattern: {stage}_rejected_{filter_type}_{N}cmpds.csv
+    rejected_matches = list(rejected_parent.glob(f"{stage_name}_rejected_{filter_type}_*cmpds.csv"))
+    
+    if not rejected_matches:
+        rejected_matches = list(rejected_parent.glob(f"test_{stage_name}_rejected_{filter_type}_*cmpds.csv"))
+    
+    if not rejected_matches:
+        return None, None
+    
+    found_rejected = rejected_matches[0]
+    
+    return found_accepted, found_rejected
+
+
 def load_or_filter(
     compute_fn: Callable[[], tuple[pd.DataFrame, pd.DataFrame]],
     accepted_csv: str | Path,
@@ -359,13 +473,17 @@ def load_or_filter(
     accepted_path = Path(accepted_csv)
     rejected_path = Path(rejected_csv)
     
-    if (not force_recompute and accepted_path.exists() and rejected_path.exists()):
-        acc_rows = _get_csv_row_count(accepted_path)
-        rej_rows = _get_csv_row_count(rejected_path)
-        if print_report:
-            print(f"[load_or_filter] Loading {accepted_path.name} ({acc_rows:,} rows) "
-                  f"+ {rejected_path.name} ({rej_rows:,} rows) ✓")
-        return pd.read_csv(accepted_path), pd.read_csv(rejected_path)
+    # Try to find existing files (including those with row count in filename)
+    if not force_recompute:
+        found_accepted, found_rejected = _find_existing_filter_csv(accepted_path, rejected_path)
+        
+        if found_accepted and found_rejected:
+            acc_rows = _get_csv_row_count(found_accepted)
+            rej_rows = _get_csv_row_count(found_rejected)
+            if print_report:
+                print(f"[load_or_filter] Loading {found_accepted.name} ({acc_rows:,} rows) "
+                      f"+ {found_rejected.name} ({rej_rows:,} rows) ✓")
+            return pd.read_csv(found_accepted), pd.read_csv(found_rejected)
     
     if print_report:
         print(f"[load_or_filter] Computing {accepted_path.name}...")

@@ -161,7 +161,7 @@ class CheckpointManager:
         return set(ids)
 
     def add_completed_ids(self, reactant_type: str, ids: set[str]) -> None:
-        """Add completed IDs for a reactant type."""
+        """Add completed IDs for a reactant type (in-memory only)."""
         key_map = {
             "aldehyde": "aldehyde",
             "carboxylic": "aldehyde",
@@ -177,7 +177,7 @@ class CheckpointManager:
         current = set(self.data["completed_ids"][key])
         current.update(ids)
         self.data["completed_ids"][key] = sorted(list(current))
-        self._save()
+        # No _save() here to avoid excessive disk I/O
 
     def update_progress(
         self,
