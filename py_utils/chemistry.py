@@ -1,25 +1,39 @@
 from __future__ import annotations
 
-# CHEMISTRY
-# Chemical reactions and transformations using SMARTS/RDKit
-
 import gzip
 import hashlib
 import json
 import multiprocessing as mp
+from bisect import bisect_right
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors, rdChemReactions
+from rdkit.Chem import rdChemReactions
 
-from py_utils._resources import _get_n_workers, _get_ram_budget_gb
+from py_utils._cache_utils import _get_cache_key, _load_cache, _save_cache
+from py_utils._resources import _get_n_workers
 
 
 # Cache directory for persistent storage
 DEFAULT_CACHE_DIR = Path("mol_files/3. Oxazolones/.cache")
+
+_REACTION_DESCRIPTOR_COLUMNS = {
+    "MW",
+    "HBD",
+    "HBA",
+    "RotB",
+    "HvyAtm",
+    "Rings",
+    "HetAtm",
+    "MR",
+    "CAtm",
+    "Atoms",
+    "tPSA",
+    "LogP",
+}
 
 # Reaction SMARTS constants (DRY — used in both main and worker functions)
 _SMARTS_EP_REACTION = (
@@ -42,34 +56,6 @@ _SMARTS_SE_REACTION = (
 )
 
 
-def _get_cache_key(*args) -> str:
-    """Generate a cache key from arguments using SHA256."""
-    key_str = "|".join(str(arg) for arg in args)
-    return hashlib.sha256(key_str.encode()).hexdigest()[:16]
-
-
-def _load_cache(cache_file: Path) -> dict[str, Any]:
-    """Load cache from gzip-compressed JSON file."""
-    if not cache_file.exists():
-        return {}
-
-    try:
-        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
-            return json.load(f)
-    except (gzip.BadGzipFile, json.JSONDecodeError, IOError):
-        return {}
-
-
-def _save_cache(cache_file: Path, cache: dict[str, Any]) -> None:
-    """Save cache to gzip-compressed JSON file."""
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with gzip.open(cache_file, "wt", encoding="utf-8", compresslevel=6) as f:
-            json.dump(cache, f, separators=(",", ":"))
-    except IOError:
-        pass
-
-
 def _append_to_temp_csv(
     out_rows: list[dict],
     temp_csv_path: Path,
@@ -82,6 +68,65 @@ def _append_to_temp_csv(
     mode = "w" if is_first_chunk else "a"
     header = is_first_chunk
     temp_df.to_csv(temp_csv_path, mode=mode, index=False, header=header)
+
+
+def _preview_columns(columns: list[str], max_items: int = 6) -> str:
+    """Return compact text preview for a list of columns."""
+    if len(columns) <= max_items:
+        return ", ".join(columns)
+    shown = ", ".join(columns[:max_items])
+    return f"{shown} ... (+{len(columns) - max_items} more)"
+
+
+def _prepare_reaction_inputs(
+    df: pd.DataFrame,
+    smiles_col: str,
+    id_col: str,
+    price_col: str,
+    reaction_name: str,
+    print_report: bool,
+) -> pd.DataFrame:
+    """Project input DataFrame to reaction-required columns and drop descriptors."""
+    required_cols = [smiles_col, id_col, price_col]
+    required_unique = list(dict.fromkeys(required_cols))
+    missing = [col for col in required_unique if col not in df.columns]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(f"Missing required columns for {reaction_name}: {missing_text}")
+
+    dropped_cols = [col for col in df.columns if col not in required_unique]
+    dropped_descriptors = [col for col in dropped_cols if col in _REACTION_DESCRIPTOR_COLUMNS]
+
+    if print_report and dropped_descriptors:
+        descriptor_text = _preview_columns(sorted(dropped_descriptors))
+        print(f"[{reaction_name}] Removed descriptor columns before reaction: {descriptor_text}")
+
+    if print_report and dropped_cols:
+        print(
+            f"[{reaction_name}] Using minimal reaction columns "
+            f"{required_unique} (dropped {len(dropped_cols)} non-reactive columns)"
+        )
+
+    return df.loc[:, required_unique].copy()
+
+
+def _cached_product_smiles(cached_result: object) -> list[str]:
+    """Normalize cached product payload to a unique SMILES list."""
+    if not isinstance(cached_result, list):
+        return []
+
+    smiles: list[str] = []
+    for item in cached_result:
+        if isinstance(item, str):
+            smiles.append(item)
+            continue
+
+        if isinstance(item, dict):
+            maybe_smi = item.get("smiles") or item.get("SMILES")
+            if isinstance(maybe_smi, str) and maybe_smi:
+                smiles.append(maybe_smi)
+
+    return list(dict.fromkeys(smiles))
 
 
 def rxn_ErlenmeyerPlochl(
@@ -100,6 +145,7 @@ def rxn_ErlenmeyerPlochl(
     output_csv: str | Path | None = None,
     checkpoint_csv: str | Path | None = None,
     checkpoint_manager: Any = None,
+    max_price_mol: float | None = None,
 ) -> pd.DataFrame:
     """
     Erlenmeyer-Plöchl reaction: combines aldehydes with carboxylic acids
@@ -127,10 +173,13 @@ def rxn_ErlenmeyerPlochl(
             Skips in-memory deduplication for large datasets.
         checkpoint_csv: Legacy parameter (ignored if checkpoint_manager provided).
         checkpoint_manager: CheckpointManager instance for robust resume support.
+        max_price_mol: Optional hard cutoff for product price per mole.
+            Pairs with ``aldehyde_price + carboxylic_price > max_price_mol`` are skipped.
 
     Returns:
         DataFrame with oxazolone products. If output_csv is provided, the
-        returned DataFrame may be loaded from the CSV file.
+        returned DataFrame may be loaded from the CSV file. Outputs contain
+        reaction-native columns (``ID``, ``SMILES``, ``PriceMol``).
     """
     # Import CheckpointManager here to avoid circular imports
     from ._checkpoint import CheckpointManager
@@ -149,6 +198,25 @@ def rxn_ErlenmeyerPlochl(
             raise ValueError(f"Missing '{id_col}' column in {name} DataFrame.")
         if price_col not in df.columns:
             raise ValueError(f"Missing '{price_col}' column in {name} DataFrame.")
+    if max_price_mol is not None and max_price_mol < 0:
+        raise ValueError("max_price_mol must be non-negative.")
+
+    df_aldehyde = _prepare_reaction_inputs(
+        df_aldehyde,
+        smiles_col,
+        id_col_aldehyde,
+        price_col,
+        "ErlenmeyerPlochl",
+        print_report,
+    )
+    df_carboxylic = _prepare_reaction_inputs(
+        df_carboxylic,
+        smiles_col,
+        id_col_carboxyl,
+        price_col,
+        "ErlenmeyerPlochl",
+        print_report,
+    )
 
     # Setup cache
     if cache_file is None:
@@ -159,7 +227,7 @@ def rxn_ErlenmeyerPlochl(
     cache = _load_cache(cache_file) if use_cache else {}
     cache_hits = 0
     cache_misses = 0
-    new_cache_entries: dict[str, list] = {}
+    new_cache_entries: dict[str, list[str]] = {}
 
     # SMARTS patterns for reactants
     patt_aldehyde = Chem.MolFromSmarts("[#6:42][CX3H:41](=[O:91])")
@@ -186,6 +254,7 @@ def rxn_ErlenmeyerPlochl(
         "not_carboxyl": 0,
         "no_product": 0,
         "problematic": 0,
+        "skipped_price": 0,
         "output_rows": 0,
         "cache_hits": 0,
         "cache_misses": 0,
@@ -232,6 +301,10 @@ def rxn_ErlenmeyerPlochl(
     # Setup temp file for streaming results
     if checkpoint_csv is not None:
         temp_csv_path = Path(checkpoint_csv)
+    elif checkpoint_manager is not None:
+        temp_csv_path = checkpoint_manager.path.parent / ".tmp_ep_results.csv"
+    elif output_csv is not None:
+        temp_csv_path = Path(output_csv).parent / ".cache" / ".tmp_ep_results.csv"
     else:
         temp_csv_path = cache_file.parent / ".tmp_ep_results.csv"
     temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +349,17 @@ def rxn_ErlenmeyerPlochl(
             if print_report:
                 print(f"[ErlenmeyerPlochl] Warning: Could not read CSV checkpoint: {e}")
 
+    if is_resuming and completed_ald_ids and not temp_csv_path.exists():
+        if print_report:
+            print(
+                "[ErlenmeyerPlochl] Checkpoint IDs found but temp CSV is missing; "
+                "restarting stage from scratch"
+            )
+        if checkpoint_manager is not None:
+            checkpoint_manager.reset()
+        completed_ald_ids = set()
+        is_resuming = False
+
     # Filter to skip already-processed aldehydes
     if is_resuming and completed_ald_ids:
         original_count = len(valid_aldehydes)
@@ -296,6 +380,7 @@ def rxn_ErlenmeyerPlochl(
 
     # Chunked processing loop
     n_chunks = (len(valid_aldehydes) + chunk_size - 1) // chunk_size if valid_aldehydes else 0
+    has_written_temp = temp_csv_path.exists() and temp_csv_path.stat().st_size > 0
     
     for chunk_idx in range(n_chunks):
         chunk_start = chunk_idx * chunk_size
@@ -308,36 +393,29 @@ def rxn_ErlenmeyerPlochl(
         
         out_rows: list[dict] = []
         work_items: list[tuple[int, int]] = []
-        new_cache_entries: dict[str, list] = {}
+        new_cache_entries: dict[str, list[str]] = {}
         
         # Cache check for this chunk
         for i, (ald_smi, ald_id, ald_price) in enumerate(chunk_aldehydes):
             for j, (carb_smi, carb_id, carb_price) in enumerate(valid_carboxylics):
+                price_total = ald_price + carb_price
+                if max_price_mol is not None and price_total > max_price_mol:
+                    stats["skipped_price"] += 1
+                    continue
+
                 cache_key = _get_cache_key(ald_smi, carb_smi, smiles_gly)
                 
                 if use_cache and cache_key in cache:
                     cached_result = cache[cache_key]
-                    if cached_result:
-                        price_total = ald_price + carb_price
+                    cached_smiles = _cached_product_smiles(cached_result)
+                    if cached_smiles:
                         ald_num = ald_id.lstrip('A')
                         carb_num = carb_id.lstrip('C')
-                        for prod_data in cached_result:
+                        for psmi in cached_smiles:
                             out_rows.append({
                                 "ID": f"A{ald_num}C{carb_num}",
-                                "SMILES": prod_data["smiles"],
+                                "SMILES": psmi,
                                 "PriceMol": price_total,
-                                "tPSA": prod_data["tPSA"],
-                                "RotB": prod_data["RotB"],
-                                "LogP": prod_data["LogP"],
-                                "MW": prod_data["MW"],
-                                "HBD": prod_data["HBD"],
-                                "HBA": prod_data["HBA"],
-                                "MR": prod_data["MR"],
-                                "HvyAtm": prod_data["HvyAtm"],
-                                "Rings": prod_data["Rings"],
-                                "CAtm": prod_data["CAtm"],
-                                "HetAtm": prod_data["HetAtm"],
-                                "Atoms": prod_data["Atoms"],
                             })
                     cache_hits += 1
                 else:
@@ -383,7 +461,13 @@ def rxn_ErlenmeyerPlochl(
                 stats["problematic"] += batch_stats["problematic"]
         
         # Flush chunk results to temp CSV
-        _append_to_temp_csv(out_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0))
+        if out_rows:
+            _append_to_temp_csv(
+                out_rows,
+                temp_csv_path,
+                is_first_chunk=not has_written_temp,
+            )
+            has_written_temp = True
         
         # Update checkpoint with completed aldehyde IDs
         if checkpoint_manager is not None and chunk_aldehydes:
@@ -402,6 +486,8 @@ def rxn_ErlenmeyerPlochl(
     # Read all results from temp CSV and deduplicate
     if temp_csv_path.exists():
         out_df = pd.read_csv(temp_csv_path)
+
+        out_df = out_df[["ID", "SMILES", "PriceMol"]]
         
         # Deduplicate in memory
         if len(out_df) > 0:
@@ -447,13 +533,13 @@ def _process_ep_batch(
     carb_data: list[tuple[str, str, float]],
     smiles_gly: str,
     keep_mol: bool = False,
-) -> tuple[list[dict], dict[str, list], dict[str, int]]:
+) -> tuple[list[dict], dict[str, list[str]], dict[str, int]]:
     """Worker function for Erlenmeyer-Plochl parallel computation."""
     rxn_ep = rdChemReactions.ReactionFromSmarts(_SMARTS_EP_REACTION)
     mol_gly = Chem.MolFromSmiles(smiles_gly)
 
     out_rows: list[dict] = []
-    new_cache: dict[str, list] = {}
+    new_cache: dict[str, list[str]] = {}
     stats = {"no_product": 0, "problematic": 0}
 
     for ald_idx, carb_idx in work_items:
@@ -483,7 +569,7 @@ def _process_ep_batch(
 
         price_total = ald_price + carb_price
         seen: set[str] = set()
-        product_data_list: list[dict] = []
+        product_smiles: list[str] = []
 
         for prod_tuple in products:
             try:
@@ -493,23 +579,7 @@ def _process_ep_batch(
                 if psmi in seen:
                     continue
                 seen.add(psmi)
-
-                prod_data = {
-                    "smiles": psmi,
-                    "MW": Descriptors.MolWt(prod_mol),
-                    "HBA": Lipinski.NumHAcceptors(prod_mol),
-                    "HBD": Lipinski.NumHDonors(prod_mol),
-                    "RotB": Lipinski.NumRotatableBonds(prod_mol),
-                    "HvyAtm": prod_mol.GetNumHeavyAtoms(),
-                    "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
-                    "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
-                    "tPSA": Descriptors.TPSA(prod_mol),
-                    "LogP": Descriptors.MolLogP(prod_mol),
-                    "MR": Descriptors.MolMR(prod_mol),
-                    "CAtm": prod_mol.GetNumAtoms() - rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
-                    "Atoms": prod_mol.GetNumAtoms(),
-                }
-                product_data_list.append(prod_data)
+                product_smiles.append(psmi)
 
                 ald_num = ald_id.lstrip('A')
                 carb_num = carb_id.lstrip('C')
@@ -517,18 +587,6 @@ def _process_ep_batch(
                     "ID": f"A{ald_num}C{carb_num}",
                     "SMILES": psmi,
                     "PriceMol": price_total,
-                    "tPSA": prod_data["tPSA"],
-                    "RotB": prod_data["RotB"],
-                    "LogP": prod_data["LogP"],
-                    "MW": prod_data["MW"],
-                    "HBD": prod_data["HBD"],
-                    "HBA": prod_data["HBA"],
-                    "MR": prod_data["MR"],
-                    "HvyAtm": prod_data["HvyAtm"],
-                    "Rings": prod_data["Rings"],
-                    "CAtm": prod_data["CAtm"],
-                    "HetAtm": prod_data["HetAtm"],
-                    "Atoms": prod_data["Atoms"],
                 }
                 if keep_mol:
                     new_row["Mol"] = prod_mol
@@ -536,7 +594,7 @@ def _process_ep_batch(
             except Exception:
                 stats["problematic"] += 1
 
-        new_cache[cache_key] = product_data_list
+        new_cache[cache_key] = product_smiles
 
     return out_rows, new_cache, stats
 
@@ -558,6 +616,7 @@ def rxn_AminolysisGFPc(
     output_csv: str | Path | None = None,
     checkpoint_csv: str | Path | None = None,
     checkpoint_manager: Any = None,
+    max_price_mol: float | None = None,
 ) -> pd.DataFrame:
     """
     Aminolysis-GFPc reaction: opens oxazolone rings with amines to form imidazolones.
@@ -585,9 +644,13 @@ def rxn_AminolysisGFPc(
         checkpoint_csv: If provided, use this file for checkpoint-based resume.
             Results are appended to this file after each chunk.
             On restart, already-processed oxazolone IDs are skipped.
+        max_price_mol: Optional hard cutoff for product price per mole.
+            Pairs with ``oxazolone_price + amine_price > max_price_mol`` are skipped.
 
     Returns:
-        DataFrame with imidazolone products.
+        DataFrame with imidazolone products containing reaction-native columns
+        (``ID``, ``SMILES``, ``PriceMol``). Descriptors must be recomputed in
+        downstream filtering stages.
     """
     # Validate inputs
     for df, name, id_col in [
@@ -600,6 +663,25 @@ def rxn_AminolysisGFPc(
             raise ValueError(f"Missing '{id_col}' column in {name} DataFrame.")
         if price_col not in df.columns:
             raise ValueError(f"Missing '{price_col}' column in {name} DataFrame.")
+    if max_price_mol is not None and max_price_mol < 0:
+        raise ValueError("max_price_mol must be non-negative.")
+
+    df_oxazolones = _prepare_reaction_inputs(
+        df_oxazolones,
+        smiles_col,
+        id_col_oxazolone,
+        price_col,
+        "AminolysisGFPc",
+        print_report,
+    )
+    df_amines = _prepare_reaction_inputs(
+        df_amines,
+        smiles_col,
+        id_col_amine,
+        price_col,
+        "AminolysisGFPc",
+        print_report,
+    )
 
     # Setup cache
     if cache_file is None:
@@ -610,7 +692,7 @@ def rxn_AminolysisGFPc(
     cache = _load_cache(cache_file) if use_cache else {}
     cache_hits = 0
     cache_misses = 0
-    new_cache_entries: dict[str, list] = {}
+    new_cache_entries: dict[str, list[str]] = {}
 
     # SMARTS pattern for amine validation
     patt_amine = Chem.MolFromSmarts("[NX3H2:10][*:11]")
@@ -627,6 +709,9 @@ def rxn_AminolysisGFPc(
         "not_amine": 0,
         "no_product": 0,
         "problematic": 0,
+        "skipped_price": 0,
+        "candidate_pairs_total": 0,
+        "candidate_pairs_affordable": 0,
         "output_rows": 0,
         "cache_hits": 0,
         "cache_misses": 0,
@@ -641,7 +726,7 @@ def rxn_AminolysisGFPc(
             print(f"[AminolysisGFPc] Using chunk_size={chunk_size} "
                   f"({chunk_size_per_worker} oxazolones per worker × {n_workers} workers)")
 
-    # Skip oxazolone validation — input CSV already validated
+    # Skip oxazolone SMARTS validation - input CSV already stage-validated
     valid_oxazolones: list[tuple[str, str, float]] = [
         (str(smi), str(id_), float(price))
         for smi, id_, price in zip(
@@ -669,20 +754,15 @@ def rxn_AminolysisGFPc(
             df_amines.loc[am_match, price_col],
         )
     ]
+    valid_amines.sort(key=lambda item: item[2])
+    amine_prices = [price for _, _, price in valid_amines]
+
     stats["invalid_amine"] = int((~am_valid).sum())
     stats["not_amine"] = int((am_valid & ~am_match).sum())
 
     # Free memory — input DataFrames no longer needed after tuple conversion
     del df_oxazolones, df_amines, am_smiles, am_mols, am_valid, am_match
 
-    # Setup temp file for streaming results
-    # Use checkpoint_csv if provided, otherwise use default temp path
-    if checkpoint_csv is not None:
-        temp_csv_path = Path(checkpoint_csv)
-    else:
-        temp_csv_path = cache_file.parent / ".tmp_ag_results.csv"
-    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    
     # Import CheckpointManager here to avoid circular imports
     from ._checkpoint import CheckpointManager
     
@@ -691,6 +771,17 @@ def rxn_AminolysisGFPc(
         output_path = Path(output_csv)
         stage_name = "Imidazolones"
         checkpoint_manager = CheckpointManager(stage_name, output_path.parent)
+
+    # Setup temp file for streaming results
+    if checkpoint_csv is not None:
+        temp_csv_path = Path(checkpoint_csv)
+    elif checkpoint_manager is not None:
+        temp_csv_path = checkpoint_manager.path.parent / ".tmp_ag_results.csv"
+    elif output_csv is not None:
+        temp_csv_path = Path(output_csv).parent / ".cache" / ".tmp_ag_results.csv"
+    else:
+        temp_csv_path = cache_file.parent / ".tmp_ag_results.csv"
+    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Check for existing checkpoint to resume from using CheckpointManager
     completed_ox_ids: set[str] = set()
@@ -721,6 +812,17 @@ def rxn_AminolysisGFPc(
         except Exception as e:
             if print_report:
                 print(f"[AminolysisGFPc] Warning: Could not read CSV checkpoint: {e}")
+
+    if is_resuming and completed_ox_ids and not temp_csv_path.exists():
+        if print_report:
+            print(
+                "[AminolysisGFPc] Checkpoint IDs found but temp CSV is missing; "
+                "restarting stage from scratch"
+            )
+        if checkpoint_manager is not None:
+            checkpoint_manager.reset()
+        completed_ox_ids = set()
+        is_resuming = False
     
     cache_hits = 0
     cache_misses = 0
@@ -735,6 +837,24 @@ def rxn_AminolysisGFPc(
         if print_report:
             print(f"[AminolysisGFPc] Skipping {original_count - len(valid_oxazolones):,} completed oxazolones, "
                   f"processing {len(valid_oxazolones):,} remaining")
+
+    candidate_pairs_total = len(valid_oxazolones) * len(valid_amines)
+    if max_price_mol is None:
+        candidate_pairs_affordable = candidate_pairs_total
+    else:
+        candidate_pairs_affordable = sum(
+            bisect_right(amine_prices, max_price_mol - ox_price)
+            for _, _, ox_price in valid_oxazolones
+        )
+
+    stats["candidate_pairs_total"] = candidate_pairs_total
+    stats["candidate_pairs_affordable"] = candidate_pairs_affordable
+
+    if print_report:
+        print(
+            f"[AminolysisGFPc] Pairing preflight: total={candidate_pairs_total:,}, "
+            f"affordable={candidate_pairs_affordable:,}, price_cutoff={max_price_mol}"
+        )
     
     # Update checkpoint with progress info
     if checkpoint_manager is not None:
@@ -742,6 +862,7 @@ def rxn_AminolysisGFPc(
     
     # Chunked processing loop
     n_chunks = (len(valid_oxazolones) + chunk_size - 1) // chunk_size if valid_oxazolones else 0
+    has_written_temp = temp_csv_path.exists() and temp_csv_path.stat().st_size > 0
     
     for chunk_idx in range(n_chunks):
         chunk_start = chunk_idx * chunk_size
@@ -754,45 +875,40 @@ def rxn_AminolysisGFPc(
         
         out_rows: list[dict] = []
         work_items: list[tuple[int, int]] = []
-        new_cache_entries: dict[str, list] = {}
+        new_cache_entries: dict[str, list[str]] = {}
         
         # Cache check for this chunk
         for i, (ox_smi, ox_id, ox_price) in enumerate(chunk_oxazolones):
-            for j, (am_smi, am_id, am_price) in enumerate(valid_amines):
+            if max_price_mol is None:
+                affordable_count = len(valid_amines)
+            else:
+                affordable_count = bisect_right(amine_prices, max_price_mol - ox_price)
+                stats["skipped_price"] += max(0, len(valid_amines) - affordable_count)
+
+            if affordable_count <= 0:
+                continue
+
+            for j in range(affordable_count):
+                am_smi, am_id, am_price = valid_amines[j]
+                price_total = ox_price + am_price
+
                 cache_key = _get_cache_key(ox_smi, am_smi)
                 
                 if use_cache and cache_key in cache:
                     cached_result = cache[cache_key]
-                    if cached_result:
-                        price_total = ox_price + am_price
+                    cached_smiles = _cached_product_smiles(cached_result)
+                    if cached_smiles:
                         am_num = am_id.lstrip('N')
-                        for prod_data in cached_result:
+                        for psmi in cached_smiles:
                             out_rows.append({
                                 "ID": f"{ox_id}N{am_num}",
-                                "SMILES": prod_data["smiles"],
+                                "SMILES": psmi,
                                 "PriceMol": price_total,
-                                "tPSA": prod_data["tPSA"],
-                                "RotB": prod_data["RotB"],
-                                "LogP": prod_data["LogP"],
-                                "MW": prod_data["MW"],
-                                "HBD": prod_data["HBD"],
-                                "HBA": prod_data["HBA"],
-                                "MR": prod_data["MR"],
-                                "HvyAtm": prod_data["HvyAtm"],
-                                "Rings": prod_data["Rings"],
-                                "CAtm": prod_data["CAtm"],
-                                "HetAtm": prod_data["HetAtm"],
-                                "Atoms": prod_data["Atoms"],
                             })
                     cache_hits += 1
                 else:
                     work_items.append((i, j))
                     cache_misses += 1
-
-        if print_report and chunk_idx == 0:
-            total_pairs = len(valid_oxazolones) * len(valid_amines)
-            print(f"[AminolysisGFPc] {total_pairs:,} total pairs "
-                  f"({n_chunks} chunks of ~{chunk_size} oxazolones)")
         
         # Parallel computation for this chunk's work items
         if work_items:
@@ -827,7 +943,13 @@ def rxn_AminolysisGFPc(
                 stats["problematic"] += batch_stats["problematic"]
         
         # Flush chunk results to temp CSV
-        _append_to_temp_csv(out_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0))
+        if out_rows:
+            _append_to_temp_csv(
+                out_rows,
+                temp_csv_path,
+                is_first_chunk=not has_written_temp,
+            )
+            has_written_temp = True
         
         # Update checkpoint with progress (save less frequently to avoid I/O overload)
         if checkpoint_manager is not None:
@@ -835,9 +957,9 @@ def rxn_AminolysisGFPc(
                 completed_chunks=chunk_idx + 1,
                 last_chunk_time=0.0
             )
-            # Save checkpoint only every 50 chunks to reduce disk I/O
-            if (chunk_idx + 1) % 50 == 0:
-                checkpoint_manager._save()
+            if chunk_oxazolones:
+                chunk_ox_ids = {ox_id for _, ox_id, _ in chunk_oxazolones}
+                checkpoint_manager.add_completed_ids("oxazolone", chunk_ox_ids)
         
         # Flush cache every 50 chunks (not every chunk) to reduce disk I/O
         if use_cache and new_cache_entries:
@@ -854,6 +976,8 @@ def rxn_AminolysisGFPc(
     # Read all results from temp CSV and deduplicate
     if temp_csv_path.exists():
         out_df = pd.read_csv(temp_csv_path)
+
+        out_df = out_df[["ID", "SMILES", "PriceMol"]]
         
         # Deduplicate in memory
         if len(out_df) > 0:
@@ -901,12 +1025,12 @@ def _process_ag_batch(
     work_items: list[tuple[int, int]],
     am_data: list[tuple[str, str, float]],
     keep_mol: bool = False,
-) -> tuple[list[dict], dict[str, list], dict[str, int]]:
+) -> tuple[list[dict], dict[str, list[str]], dict[str, int]]:
     """Worker function for Aminolysis-GFPc parallel computation."""
     rxn_ag = rdChemReactions.ReactionFromSmarts(_SMARTS_AG_REACTION)
 
     out_rows: list[dict] = []
-    new_cache: dict[str, list] = {}
+    new_cache: dict[str, list[str]] = {}
     stats = {"no_product": 0, "problematic": 0}
 
     for ox_idx, am_idx in work_items:
@@ -936,7 +1060,7 @@ def _process_ag_batch(
 
         price_total = ox_price + am_price
         seen: set[str] = set()
-        product_data_list: list[dict] = []
+        product_smiles: list[str] = []
 
         for prod_tuple in products:
             # prod_tuple contains: (imidazolone_product, water_subproduct)
@@ -948,41 +1072,13 @@ def _process_ag_batch(
                 if psmi in seen:
                     continue
                 seen.add(psmi)
-
-                prod_data = {
-                    "smiles": psmi,
-                    "MW": Descriptors.MolWt(prod_mol),
-                    "HBA": Lipinski.NumHAcceptors(prod_mol),
-                    "HBD": Lipinski.NumHDonors(prod_mol),
-                    "RotB": Lipinski.NumRotatableBonds(prod_mol),
-                    "HvyAtm": prod_mol.GetNumHeavyAtoms(),
-                    "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
-                    "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
-                    "tPSA": Descriptors.TPSA(prod_mol),
-                    "LogP": Descriptors.MolLogP(prod_mol),
-                    "MR": Descriptors.MolMR(prod_mol),
-                    "CAtm": prod_mol.GetNumAtoms() - rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
-                    "Atoms": prod_mol.GetNumAtoms(),
-                }
-                product_data_list.append(prod_data)
+                product_smiles.append(psmi)
 
                 am_num = am_id.lstrip('N')
                 new_row: dict = {
                     "ID": f"{ox_id}N{am_num}",
                     "SMILES": psmi,
                     "PriceMol": price_total,
-                    "tPSA": prod_data["tPSA"],
-                    "RotB": prod_data["RotB"],
-                    "LogP": prod_data["LogP"],
-                    "MW": prod_data["MW"],
-                    "HBD": prod_data["HBD"],
-                    "HBA": prod_data["HBA"],
-                    "MR": prod_data["MR"],
-                    "HvyAtm": prod_data["HvyAtm"],
-                    "Rings": prod_data["Rings"],
-                    "CAtm": prod_data["CAtm"],
-                    "HetAtm": prod_data["HetAtm"],
-                    "Atoms": prod_data["Atoms"],
                 }
                 if keep_mol:
                     new_row["Mol"] = prod_mol
@@ -990,7 +1086,7 @@ def _process_ag_batch(
             except Exception:
                 stats["problematic"] += 1
 
-        new_cache[cache_key] = product_data_list
+        new_cache[cache_key] = product_smiles
 
     return out_rows, new_cache, stats
 
@@ -1008,6 +1104,7 @@ def rxn_SulphurExchange(
     checkpoint_csv: str | Path | None = None,
     chunk_size: int = 1000,  # Reduced from 5000 for safer checkpointing
     checkpoint_manager: Any = None,
+    max_price_mol: float | None = None,
 ) -> pd.DataFrame:
     """
     Sulphur-Exchange reaction: converts oxazolones to thiazolones by replacing oxygen with sulphur.
@@ -1027,9 +1124,13 @@ def rxn_SulphurExchange(
         checkpoint_csv: Legacy parameter (ignored if checkpoint_manager provided).
         chunk_size: Number of oxazolones per chunk for checkpointing (default: 1000).
         checkpoint_manager: CheckpointManager instance for robust resume support.
+        max_price_mol: Optional hard cutoff for product price per mole.
+            Oxazolones with ``price_col + thioacetic_price_eq > max_price_mol`` are skipped.
 
     Returns:
-        DataFrame with thiazolone products.
+        DataFrame with thiazolone products containing reaction-native columns
+        (``ID``, ``SMILES``, ``PriceMol``). Descriptors must be recomputed in
+        downstream filtering stages.
     """
     # Validate inputs
     if smiles_col not in df_oxazolones.columns:
@@ -1040,6 +1141,17 @@ def rxn_SulphurExchange(
         raise ValueError(f"Missing '{price_col}' column in oxazolones DataFrame.")
     if thioacetic_price_eq < 0:
         raise ValueError(f"Thioacetic price must be non-negative, got {thioacetic_price_eq}.")
+    if max_price_mol is not None and max_price_mol < 0:
+        raise ValueError("max_price_mol must be non-negative.")
+
+    df_oxazolones = _prepare_reaction_inputs(
+        df_oxazolones,
+        smiles_col,
+        id_col,
+        price_col,
+        "SulphurExchange",
+        print_report,
+    )
 
     # Setup cache
     if cache_file is None:
@@ -1050,7 +1162,7 @@ def rxn_SulphurExchange(
     cache = _load_cache(cache_file) if use_cache else {}
     cache_hits = 0
     cache_misses = 0
-    new_cache_entries: dict[str, list] = {}
+    new_cache_entries: dict[str, list[str]] = {}
 
     # SMARTS patterns
     patt_oxazolone = Chem.MolFromSmarts("[O:51]=[C:5]1[O:1][C:2]([#6:21])=[N:3]/[C:4]1=[C:41]\\[#6:42]")
@@ -1074,8 +1186,11 @@ def rxn_SulphurExchange(
         "thioacetic_price_eq": thioacetic_price_eq,
         "invalid_oxazolone": 0,
         "not_oxazolone": 0,
+        "skipped_price": 0,
         "no_product": 0,
         "problematic": 0,
+        "candidate_pairs_total": 0,
+        "candidate_pairs_affordable": 0,
         "output_rows": 0,
         "cache_hits": 0,
         "cache_misses": 0,
@@ -1093,13 +1208,6 @@ def rxn_SulphurExchange(
     stats["invalid_oxazolone"] = 0
     stats["not_oxazolone"] = 0
 
-    # Setup temp file for streaming results
-    if checkpoint_csv is not None:
-        temp_csv_path = Path(checkpoint_csv)
-    else:
-        temp_csv_path = cache_file.parent / ".tmp_se_results.csv"
-    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
-
     # Import CheckpointManager here to avoid circular imports
     from ._checkpoint import CheckpointManager
     
@@ -1108,6 +1216,17 @@ def rxn_SulphurExchange(
         output_path = Path(output_csv)
         stage_name = "Thiazolones"
         checkpoint_manager = CheckpointManager(stage_name, output_path.parent)
+
+    # Setup temp file for streaming results
+    if checkpoint_csv is not None:
+        temp_csv_path = Path(checkpoint_csv)
+    elif checkpoint_manager is not None:
+        temp_csv_path = checkpoint_manager.path.parent / ".tmp_se_results.csv"
+    elif output_csv is not None:
+        temp_csv_path = Path(output_csv).parent / ".cache" / ".tmp_se_results.csv"
+    else:
+        temp_csv_path = cache_file.parent / ".tmp_se_results.csv"
+    temp_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Check for existing checkpoint to resume from using CheckpointManager
     completed_ox_ids: set[str] = set()
@@ -1140,6 +1259,17 @@ def rxn_SulphurExchange(
             if print_report:
                 print(f"[SulphurExchange] Warning: Could not read CSV checkpoint: {e}")
 
+    if is_resuming and completed_ox_ids and not temp_csv_path.exists():
+        if print_report:
+            print(
+                "[SulphurExchange] Checkpoint IDs found but temp CSV is missing; "
+                "restarting stage from scratch"
+            )
+        if checkpoint_manager is not None:
+            checkpoint_manager.reset()
+        completed_ox_ids = set()
+        is_resuming = False
+
     # Filter to skip already-processed oxazolones
     if is_resuming and completed_ox_ids:
         original_count = len(valid_oxazolones)
@@ -1151,6 +1281,24 @@ def rxn_SulphurExchange(
             print(f"[SulphurExchange] Skipping {original_count - len(valid_oxazolones):,} completed oxazolones, "
                   f"processing {len(valid_oxazolones):,} remaining")
 
+    candidate_pairs_total = len(valid_oxazolones)
+    if max_price_mol is None:
+        candidate_pairs_affordable = candidate_pairs_total
+    else:
+        candidate_pairs_affordable = sum(
+            1 for _, _, ox_price in valid_oxazolones
+            if (ox_price + thioacetic_price_eq) <= max_price_mol
+        )
+
+    stats["candidate_pairs_total"] = candidate_pairs_total
+    stats["candidate_pairs_affordable"] = candidate_pairs_affordable
+
+    if print_report:
+        print(
+            f"[SulphurExchange] Pairing preflight: total={candidate_pairs_total:,}, "
+            f"affordable={candidate_pairs_affordable:,}, price_cutoff={max_price_mol}"
+        )
+
     # Update checkpoint with progress info
     if checkpoint_manager is not None:
         checkpoint_manager.update_progress(total_chunks=total_chunks)
@@ -1160,29 +1308,22 @@ def rxn_SulphurExchange(
     work_items: list[int] = []
 
     for i, (ox_smi, ox_id, ox_price) in enumerate(valid_oxazolones):
+        if max_price_mol is not None and (ox_price + thioacetic_price_eq) > max_price_mol:
+            stats["skipped_price"] += 1
+            continue
+
         cache_key = _get_cache_key(ox_smi, smiles_thioacetic)
 
         if use_cache and cache_key in cache:
             cached_result = cache[cache_key]
-            if cached_result:
+            cached_smiles = _cached_product_smiles(cached_result)
+            if cached_smiles:
                 price_total = ox_price + thioacetic_price_eq
-                for prod_data in cached_result:
+                for psmi in cached_smiles:
                     out_rows.append({
                         "ID": f"{ox_id}S",
-                        "SMILES": prod_data["smiles"],
+                        "SMILES": psmi,
                         "PriceMol": price_total,
-                        "tPSA": prod_data["tPSA"],
-                        "RotB": prod_data["RotB"],
-                        "LogP": prod_data["LogP"],
-                        "MW": prod_data["MW"],
-                        "HBD": prod_data["HBD"],
-                        "HBA": prod_data["HBA"],
-                        "MR": prod_data["MR"],
-                        "HvyAtm": prod_data["HvyAtm"],
-                        "Rings": prod_data["Rings"],
-                        "CAtm": prod_data["CAtm"],
-                        "HetAtm": prod_data["HetAtm"],
-                        "Atoms": prod_data["Atoms"],
                     })
             cache_hits += 1
         else:
@@ -1195,6 +1336,7 @@ def rxn_SulphurExchange(
 
     # Chunked processing with checkpointing
     n_chunks = (len(work_items) + chunk_size - 1) // chunk_size if work_items else 0
+    has_written_temp = temp_csv_path.exists() and temp_csv_path.stat().st_size > 0
 
     for chunk_idx in range(n_chunks):
         chunk_start = chunk_idx * chunk_size
@@ -1245,7 +1387,8 @@ def rxn_SulphurExchange(
         # Append chunk results to checkpoint CSV
         if chunk_rows:
             out_rows.extend(chunk_rows)
-            _append_to_temp_csv(chunk_rows, temp_csv_path, is_first_chunk=(chunk_idx == 0 and not is_resuming))
+            _append_to_temp_csv(chunk_rows, temp_csv_path, is_first_chunk=not has_written_temp)
+            has_written_temp = True
 
         # Update checkpoint with completed oxazolone IDs
         if checkpoint_manager is not None and chunk_items:
@@ -1273,6 +1416,9 @@ def rxn_SulphurExchange(
             print(f"[SulphurExchange] Checkpoint saved: {checkpoint_manager.path.name}")
 
     out_df = pd.DataFrame(out_rows)
+
+    if len(out_df) > 0:
+        out_df = out_df[["ID", "SMILES", "PriceMol"]]
     
     # Deduplicate
     if len(out_df) > 0:
@@ -1310,13 +1456,13 @@ def _process_se_batch(
     ox_chunk: list[tuple[str, str, float]],
     smiles_thioacetic: str,
     thioacetic_price_eq: float,
-) -> tuple[list[dict], dict[str, list], dict[str, int]]:
+) -> tuple[list[dict], dict[str, list[str]], dict[str, int]]:
     """Worker function for Sulphur-Exchange parallel computation."""
     rxn_se = rdChemReactions.ReactionFromSmarts(_SMARTS_SE_REACTION)
     mol_thioacetic = Chem.MolFromSmiles("[C:93][C:94](=[O:85])[SH:10]")
 
     out_rows: list[dict] = []
-    new_cache: dict[str, list] = {}
+    new_cache: dict[str, list[str]] = {}
     stats = {"no_product": 0, "problematic": 0}
 
     for ox_smi, ox_id, ox_price in ox_chunk:
@@ -1343,7 +1489,7 @@ def _process_se_batch(
 
         # Only one product tuple per reaction (1-to-1)
         seen: set[str] = set()
-        product_data_list: list[dict] = []
+        product_smiles: list[str] = []
 
         for prod_tuple in products:
             # Take only first product [0] - thiazolone
@@ -1355,47 +1501,18 @@ def _process_se_batch(
                 if psmi in seen:
                     continue
                 seen.add(psmi)
-
-                prod_data = {
-                    "smiles": psmi,
-                    "MW": Descriptors.MolWt(prod_mol),
-                    "HBA": Lipinski.NumHAcceptors(prod_mol),
-                    "HBD": Lipinski.NumHDonors(prod_mol),
-                    "RotB": Lipinski.NumRotatableBonds(prod_mol),
-                    "HvyAtm": prod_mol.GetNumHeavyAtoms(),
-                    "Rings": rdMolDescriptors.CalcNumRings(prod_mol),
-                    "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
-                    "tPSA": Descriptors.TPSA(prod_mol),
-                    "LogP": Descriptors.MolLogP(prod_mol),
-                    "MR": Descriptors.MolMR(prod_mol),
-                    "CAtm": prod_mol.GetNumAtoms() - rdMolDescriptors.CalcNumHeteroatoms(prod_mol),
-                    "Atoms": prod_mol.GetNumAtoms(),
-                }
-                product_data_list.append(prod_data)
+                product_smiles.append(psmi)
 
                 # Add to output rows with thioacetic price included
                 new_row: dict = {
                     "ID": f"{ox_id}S",
                     "SMILES": psmi,
                     "PriceMol": ox_price + thioacetic_price_eq,
-                    "tPSA": prod_data["tPSA"],
-                    "RotB": prod_data["RotB"],
-                    "LogP": prod_data["LogP"],
-                    "MW": prod_data["MW"],
-                    "HBD": prod_data["HBD"],
-                    "HBA": prod_data["HBA"],
-                    "MR": prod_data["MR"],
-                    "HvyAtm": prod_data["HvyAtm"],
-                    "Rings": prod_data["Rings"],
-                    "CAtm": prod_data["CAtm"],
-                    "HetAtm": prod_data["HetAtm"],
-                    "Atoms": prod_data["Atoms"],
                 }
                 out_rows.append(new_row)
             except Exception:
                 stats["problematic"] += 1
 
-        new_cache[cache_key] = product_data_list
+        new_cache[cache_key] = product_smiles
 
     return out_rows, new_cache, stats
-

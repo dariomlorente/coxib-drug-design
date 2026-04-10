@@ -19,43 +19,15 @@ from rdkit import Chem
 from rdkit.Chem import Descriptors, Lipinski, MolToSmiles, SDWriter, rdMolDescriptors
 from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 
+from py_utils._cache_utils import _get_cache_key, _load_cache, _save_cache
 from py_utils._resources import _get_n_workers
 
 
 # Cache directory for persistent storage
 DEFAULT_CACHE_DIR = Path("mol_files/3. Oxazolones/.cache")
 
-
-def _get_cache_key(*args) -> str:
-    """Generate a cache key from arguments using SHA256."""
-    key_str = "|".join(str(arg) for arg in args)
-    return hashlib.sha256(key_str.encode()).hexdigest()[:16]
-
-
-def _load_cache(cache_file: Path) -> dict[str, Any]:
-    """Load cache from gzip-compressed JSON file."""
-    if not cache_file.exists():
-        return {}
-    
-    try:
-        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
-            return json.load(f)
-    except (gzip.BadGzipFile, json.JSONDecodeError, IOError):
-        print(f"⚠️  Cache file corrupted, starting fresh: {cache_file}")
-        return {}
-
-
-def _save_cache(cache_file: Path, cache: dict[str, Any]) -> None:
-    """Save cache to gzip-compressed JSON file."""
-    cache_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with gzip.open(cache_file, "wt", encoding="utf-8", compresslevel=6) as f:
-            json.dump(cache, f, separators=(",", ":"))
-    except IOError as e:
-        print(f"⚠️  Error saving cache: {e}")
-
-
 def sdf_to_dataframe(sdf_path: str, id_prefix: str, id_prop: str = "Catalog_ID") -> pd.DataFrame:
+
     """
     Read an SDF file and return a DataFrame with ID and SMILES columns.
     
@@ -253,6 +225,8 @@ def filter_Veber(
     max_Rings: int | None = None,
     min_CAtm: int | None = None,
     min_HetAtm: int | None = None,
+    max_price_mol: float | None = None,
+    recompute_descriptors: bool = False,
     smiles_col: str = "SMILES",
     id_col: str = "ID",
     print_report: bool = True,
@@ -262,9 +236,9 @@ def filter_Veber(
     filter_chunk_size: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Filter DataFrame by Veber bioavailability criteria.
-    
+
     Only calculates and checks each property when the corresponding limit is
-    explicitly provided. Comparisons are inclusive (≤ / ≥) for all criteria
+    explicitly provided. Comparisons are inclusive (<= / >=) for all criteria
     except min_CAtm and min_HetAtm, which are exclusive (strictly >).
     LogP is calculated using Crippen's contribution-based method (Descriptors.MolLogP).
 
@@ -272,11 +246,11 @@ def filter_Veber(
     results to disk and avoid memory exhaustion.
 
     Parameters:
-        df: Input DataFrame with SMILES column and RDKit properties already added.
-        max_tPSA: Topological PSA upper limit (Å², includes S and P).
+        df: Input DataFrame with at least ``id_col``, ``smiles_col``, and ``PriceMol``.
+        max_tPSA: Topological PSA upper limit (A^2, includes S and P).
         max_RotB: Rotatable bonds upper limit.
         max_LogP: Crippen LogP upper limit.
-        min_tPSA: Topological PSA lower limit (Å²).
+        min_tPSA: Topological PSA lower limit (A^2).
         max_MWT: Molecular weight upper limit (Da).
         max_HBD: H-bond donors upper limit.
         max_HBA: H-bond acceptors upper limit.
@@ -288,11 +262,14 @@ def filter_Veber(
         max_Rings: Ring count upper limit.
         min_CAtm: Carbon atom count lower limit (exclusive, strictly >).
         min_HetAtm: Heteroatom count lower limit (exclusive, strictly >).
+        max_price_mol: Price-per-molecule upper limit (inclusive).
+        recompute_descriptors: If True, drop existing descriptor columns and
+            recompute required ones from SMILES.
         smiles_col: Column name for SMILES strings.
         id_col: Column name for compound IDs.
         print_report: Print acceptance/rejection summary.
         use_cache: Use persistent cache for calculated properties.
-        cache_file: Cache file path (auto-generated from DataFrame and filters if None).
+        cache_file: Cache file path (auto-generated if None).
         output_csv: If provided, stream accepted rows to this CSV file instead of
             holding them in memory (recommended for >1M rows).
         filter_chunk_size: Chunk size for filtering when output_csv is used.
@@ -302,159 +279,188 @@ def filter_Veber(
         Tuple of (accepted, rejected) DataFrames. When output_csv is used,
         accepted DataFrame is empty (data is on disk).
     """
+    required_base_cols = [id_col, smiles_col, "PriceMol"]
+    missing_base_cols = [col for col in required_base_cols if col not in df.columns]
+    if missing_base_cols:
+        missing_text = ", ".join(missing_base_cols)
+        raise ValueError(f"Missing required columns for filter_Veber: {missing_text}")
+
+    descriptor_cols = {
+        "MW",
+        "HBD",
+        "HBA",
+        "RotB",
+        "HvyAtm",
+        "Rings",
+        "HetAtm",
+        "MR",
+        "CAtm",
+        "Atoms",
+        "tPSA",
+        "LogP",
+    }
+
     df_work = df.copy()
-    
+    if recompute_descriptors:
+        stale_cols = [col for col in df_work.columns if col in descriptor_cols]
+        if stale_cols and print_report:
+            print(
+                "[filter_Veber] Dropping descriptor columns before recomputation: "
+                + ", ".join(sorted(stale_cols))
+            )
+        df_work = df_work.drop(columns=stale_cols, errors="ignore")
+
     # --- Load cache if caching is enabled ---
     cache: dict[str, dict] = {}
     cache_hits = 0
     cache_misses = 0
-    
+
     if use_cache:
         if cache_file is None:
             cache_file = Path("mol_files/3. Oxazolones/.cache/veber_filter_cache.json.gz")
         else:
             cache_file = Path(cache_file)
-        
+
         cache = _load_cache(cache_file)
     else:
-        cache_file = Path("/dev/null")  # Dummy value when not using cache
+        cache_file = Path("/dev/null")
 
-    # --- On-demand property calculation (only when the filter is active) ---
-    # Use chunked processing to avoid OOM with large datasets (e.g., millions of oxazolones)
-    need_tpsa = max_tPSA is not None or min_tPSA is not None
-    need_logp = max_LogP is not None or min_LogP is not None
-    need_mr = min_MR is not None or max_MR is not None
-    need_catm = min_CAtm is not None
+    if recompute_descriptors:
+        required_descriptor_cols = [
+            "MW",
+            "HBD",
+            "HBA",
+            "RotB",
+            "HvyAtm",
+            "Rings",
+            "HetAtm",
+            "MR",
+            "CAtm",
+            "Atoms",
+            "tPSA",
+            "LogP",
+        ]
+    else:
+        required_descriptor_cols: list[str] = []
+        if max_tPSA is not None or min_tPSA is not None:
+            required_descriptor_cols.append("tPSA")
+        if max_RotB is not None:
+            required_descriptor_cols.append("RotB")
+        if max_LogP is not None or min_LogP is not None:
+            required_descriptor_cols.append("LogP")
+        if max_MWT is not None:
+            required_descriptor_cols.append("MW")
+        if max_HBD is not None:
+            required_descriptor_cols.append("HBD")
+        if max_HBA is not None:
+            required_descriptor_cols.append("HBA")
+        if min_MR is not None or max_MR is not None:
+            required_descriptor_cols.append("MR")
+        if min_HvyAtm is not None or max_HvyAtm is not None:
+            required_descriptor_cols.append("HvyAtm")
+        if max_Rings is not None:
+            required_descriptor_cols.append("Rings")
+        if min_CAtm is not None:
+            required_descriptor_cols.append("CAtm")
+        if min_HetAtm is not None:
+            required_descriptor_cols.append("HetAtm")
 
-    if need_tpsa or need_logp or need_mr or need_catm:
+    required_descriptor_cols = list(dict.fromkeys(required_descriptor_cols))
+    missing_required = [col for col in required_descriptor_cols if col not in df_work.columns]
+
+    descriptor_calculators: dict[str, Any] = {}
+    if "tPSA" in missing_required:
+        descriptor_calculators["tPSA"] = lambda mol: Descriptors.TPSA(mol, includeSandP=True)
+    if "RotB" in missing_required:
+        descriptor_calculators["RotB"] = Lipinski.NumRotatableBonds
+    if "LogP" in missing_required:
+        descriptor_calculators["LogP"] = Descriptors.MolLogP
+    if "MW" in missing_required:
+        descriptor_calculators["MW"] = Descriptors.MolWt
+    if "HBD" in missing_required:
+        descriptor_calculators["HBD"] = Lipinski.NumHDonors
+    if "HBA" in missing_required:
+        descriptor_calculators["HBA"] = Lipinski.NumHAcceptors
+    if "MR" in missing_required:
+        descriptor_calculators["MR"] = Descriptors.MolMR
+    if "HvyAtm" in missing_required:
+        descriptor_calculators["HvyAtm"] = lambda mol: mol.GetNumHeavyAtoms()
+    if "Rings" in missing_required:
+        descriptor_calculators["Rings"] = rdMolDescriptors.CalcNumRings
+    if "CAtm" in missing_required:
+        descriptor_calculators["CAtm"] = lambda mol: sum(
+            1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6
+        )
+    if "Atoms" in missing_required:
+        descriptor_calculators["Atoms"] = lambda mol: mol.GetNumAtoms()
+    if "HetAtm" in missing_required:
+        descriptor_calculators["HetAtm"] = rdMolDescriptors.CalcNumHeteroatoms
+
+    if descriptor_calculators:
         chunk_size = 10000
         n_rows = len(df_work)
         n_chunks = (n_rows + chunk_size - 1) // chunk_size
-        
+
         if print_report:
             print(f"[Veber] Processing {n_rows:,} molecules in {n_chunks} chunks...")
-        
-        # Initialize columns
-        if need_tpsa:
-            df_work["tPSA"] = None
-        if need_logp:
-            df_work["LogP"] = None
-        if need_mr:
-            df_work["MR"] = None
-        if need_catm:
-            df_work["CAtm"] = 0
-        
-        # Process in chunks to avoid creating millions of mol objects at once
+
+        zero_default_cols = {"RotB", "HBD", "HBA", "HvyAtm", "Rings", "CAtm", "Atoms", "HetAtm"}
+        for col in descriptor_calculators:
+            df_work[col] = 0 if col in zero_default_cols else None
+
         for chunk_idx, chunk_start in enumerate(range(0, n_rows, chunk_size)):
             chunk_end = min(chunk_start + chunk_size, n_rows)
-            
+
             if print_report and (chunk_idx + 1) % 100 == 0:
                 print(f"[Veber] Processing chunk {chunk_idx + 1}/{n_chunks}...")
-            
+
             chunk_rows = df_work.iloc[chunk_start:chunk_end]
             chunk_smiles = chunk_rows[smiles_col].astype(str)
             chunk_mols = chunk_smiles.map(Chem.MolFromSmiles)
-            
-            # Calculate properties
-            if need_tpsa:
-                tpsa_values = []
-                for i, (smi, m) in enumerate(zip(chunk_smiles, chunk_mols)):
-                    cached_val = None
-                    if use_cache and smi in cache and "tPSA" in cache[smi]:
-                        cached_val = cache[smi]["tPSA"]
-                    
-                    if cached_val is not None:
-                        tpsa_values.append(cached_val)
+
+            for col, calc_fn in descriptor_calculators.items():
+                default_value: float | int | None = 0 if col in zero_default_cols else None
+                values: list[float | int | None] = []
+
+                for smi, mol in zip(chunk_smiles, chunk_mols):
+                    cached_value = None
+                    if use_cache and smi in cache and col in cache[smi]:
+                        cached_value = cache[smi][col]
+
+                    if cached_value is not None:
+                        values.append(cached_value)
                         cache_hits += 1
-                    elif m is not None:
-                        val = Descriptors.TPSA(m, includeSandP=True)
-                        tpsa_values.append(val)
-                        if use_cache:
-                            if smi not in cache:
-                                cache[smi] = {}
-                            cache[smi]["tPSA"] = val
+                        continue
+
+                    if mol is None:
+                        values.append(default_value)
                         cache_misses += 1
-                    else:
-                        tpsa_values.append(None)
-                        cache_misses += 1
-                df_work.loc[chunk_start:chunk_end-1, "tPSA"] = tpsa_values
-            
-            if need_logp:
-                logp_values = []
-                for i, (smi, m) in enumerate(zip(chunk_smiles, chunk_mols)):
-                    cached_val = None
-                    if use_cache and smi in cache and "LogP" in cache[smi]:
-                        cached_val = cache[smi]["LogP"]
-                    
-                    if cached_val is not None:
-                        logp_values.append(cached_val)
-                        cache_hits += 1
-                    elif m is not None:
-                        val = Descriptors.MolLogP(m)
-                        logp_values.append(val)
-                        if use_cache:
-                            if smi not in cache:
-                                cache[smi] = {}
-                            cache[smi]["LogP"] = val
-                        cache_misses += 1
-                    else:
-                        logp_values.append(None)
-                        cache_misses += 1
-                df_work.loc[chunk_start:chunk_end-1, "LogP"] = logp_values
-            
-            if need_mr:
-                mr_values = []
-                for i, (smi, m) in enumerate(zip(chunk_smiles, chunk_mols)):
-                    cached_val = None
-                    if use_cache and smi in cache and "MR" in cache[smi]:
-                        cached_val = cache[smi]["MR"]
-                    
-                    if cached_val is not None:
-                        mr_values.append(cached_val)
-                        cache_hits += 1
-                    elif m is not None:
-                        val = Descriptors.MolMR(m)
-                        mr_values.append(val)
-                        if use_cache:
-                            if smi not in cache:
-                                cache[smi] = {}
-                            cache[smi]["MR"] = val
-                        cache_misses += 1
-                    else:
-                        mr_values.append(None)
-                        cache_misses += 1
-                df_work.loc[chunk_start:chunk_end-1, "MR"] = mr_values
-            
-            if need_catm:
-                catm_values = []
-                for i, (smi, m) in enumerate(zip(chunk_smiles, chunk_mols)):
-                    cached_val = None
-                    if use_cache and smi in cache and "CAtm" in cache[smi]:
-                        cached_val = cache[smi]["CAtm"]
-                    
-                    if cached_val is not None:
-                        catm_values.append(cached_val)
-                        cache_hits += 1
-                    elif m is not None:
-                        val = sum(1 for a in m.GetAtoms() if a.GetAtomicNum() == 6)
-                        catm_values.append(val)
-                        if use_cache:
-                            if smi not in cache:
-                                cache[smi] = {}
-                            cache[smi]["CAtm"] = val
-                        cache_misses += 1
-                    else:
-                        catm_values.append(0)
-                        cache_misses += 1
-                df_work.loc[chunk_start:chunk_end-1, "CAtm"] = catm_values
-            
-            # Save cache every 100 chunks (not every chunk) to reduce disk I/O
+                        continue
+
+                    try:
+                        value = calc_fn(mol)
+                    except Exception:
+                        value = default_value
+
+                    values.append(value)
+                    if use_cache and value is not None:
+                        if smi not in cache:
+                            cache[smi] = {}
+                        cache[smi][col] = value
+                    cache_misses += 1
+
+                df_work.loc[chunk_start:chunk_end - 1, col] = values
+
             if use_cache and cache and (chunk_idx + 1) % 100 == 0:
                 _save_cache(cache_file, cache)
-        
-        # Save final cache after all chunks complete
+
         if use_cache and cache:
             _save_cache(cache_file, cache)
+
+    still_missing = [col for col in required_descriptor_cols if col not in df_work.columns]
+    if still_missing:
+        missing_text = ", ".join(still_missing)
+        raise ValueError(f"Failed to compute required descriptor columns: {missing_text}")
 
     # --- Filtering (all inclusive ≤/≥, except min_CAtm and min_HetAtm which are strict >) ---
     # Each criterion contributes a (bool_mask, label_series) pair.
@@ -500,6 +506,9 @@ def filter_Veber(
     if max_Rings is not None:
         m = df_work["Rings"] > max_Rings
         criteria.append((m, df_work.loc[m, "Rings"].map(lambda v: f"Rings={v}>{max_Rings}")))
+    if max_price_mol is not None:
+        m = df_work["PriceMol"] > max_price_mol
+        criteria.append((m, df_work.loc[m, "PriceMol"].map(lambda v: f"PriceMol={v:.2f}>{max_price_mol}")))
     if min_CAtm is not None:
         m = df_work["CAtm"] <= min_CAtm  # exclusive
         criteria.append((m, df_work.loc[m, "CAtm"].map(lambda v: f"CAtm={v}<={min_CAtm}")))
@@ -576,7 +585,7 @@ def filter_Veber(
     # Select only desired columns for rejected (Veber)
     if len(df_rejected) > 0:
         # Keep only: ID, SMILES, PriceMol, tPSA, RotB, LogP, MW, HBD, HBA, Rejection
-        desired_cols = ["ID", "SMILES", "PriceMol", "tPSA", "RotB", "LogP", "MW", "HBD", "HBA", "Rejection"]
+        desired_cols = [id_col, smiles_col, "PriceMol", "tPSA", "RotB", "LogP", "MW", "HBD", "HBA", "Rejection"]
         existing_cols = [col for col in desired_cols if col in df_rejected.columns]
         df_rejected = df_rejected[existing_cols].reset_index(drop=True)
 

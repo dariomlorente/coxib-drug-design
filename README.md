@@ -23,7 +23,7 @@ conda activate coxibs
 
 ## Computational Pipeline
 
-Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the Enamine commercial catalogue and filtered by price and bioavailability (Veber criteria). Filtered sets are then combined through three encoded reaction pathways. The resulting products (imidazolones and thiazolones) are filtered for structural alerts (Brenk + PAINS) before export:
+Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the Enamine commercial catalogue and filtered by price and bioavailability (Veber criteria). A hard global molecular-price cutoff is also enforced (`PriceMol <= MAX_PRICE_MOL`, currently `200.00`) in Veber filters and reaction pairing. Filtered sets are then combined through three encoded reaction pathways. The resulting products (imidazolones and thiazolones) are filtered for structural alerts (Brenk + PAINS) before export:
 
 | Step | Reaction | Inputs | Output |
 |------|----------|--------|--------|
@@ -39,6 +39,7 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 |------|-------------|
 | `py_utils/` | Python package: reactions, filters, I/O, pricing client |
 | `py_utils/_checkpoint.py` | Checkpoint management for robust resume support |
+| `py_utils/_pipeline.py` | Stage paths + load/resume orchestration |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization |
@@ -75,6 +76,10 @@ The pipeline now uses a robust checkpoint system for crash recovery:
 - **Checkpoints**: `.cache/{Stage}_checkpoint.json` (metadata in `.cache/`)
 - **Filter outputs**: `{Stage}_{filter}_{N}cmpds.csv` (row count + filter suffix)
 - **Final exports**: `{Stage}_brenkpains_{N}cmpds.csv` (row count + filter suffix)
+
+Resume integrity checks:
+- **Reactions** resume by completed reactant IDs stored in checkpoint metadata.
+- **Filters** are only reused when `accepted_rows + rejected_rows == input_rows`; otherwise they are recomputed.
 
 If the kernel crashes, re-running the notebook will:
 1. Detect the checkpoint JSON in `.cache/`

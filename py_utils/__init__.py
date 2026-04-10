@@ -1,6 +1,6 @@
 """
 Cheminformatics utilities for virtual screening and compound generation.
-Modules: chemistry, dataframes, enamine_api, _resources, _checkpoint, _pipeline.
+Modules: chemistry, dataframes, enamine_api, _resources, _checkpoint, _pipeline, _cache_utils.
 """
 
 from .chemistry import (
@@ -41,7 +41,7 @@ from ._pipeline import (
     save_dataframe,
 )
 
-__version__ = "3.19" # Month.Day, revised on 2026-03-19
+__version__ = "4.10" # Month.Day, revised on 2026-04-10
 __author__ = "Dario M Lorente"
 
 __all__ = [
