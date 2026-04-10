@@ -1,19 +1,28 @@
 """
 Cheminformatics utilities for virtual screening and compound generation.
-Modules: chemistry, dataframes, enamine_api, _resources, _checkpoint, _pipeline, _cache_utils.
+
+Modules:
+  - reactions  : rxn_ErlenmeyerPlochl, rxn_AminolysisGFPc, rxn_SulphurExchange
+  - io        : sdf_to_dataframe, add_rdkit_properties, save helpers
+  - filters   : filter_Veber, filter_BrenkPAINS
+  - enamine_api: EnamineClient, add_enamine_prices
+  - pipeline  : CheckpointManager, load_or_run, load_or_filter, paths
 """
 
-from .chemistry import (
+from .reactions import (
     rxn_ErlenmeyerPlochl,
     rxn_AminolysisGFPc,
     rxn_SulphurExchange,
 )
 
-from .dataframes import (
+from .io import (
     sdf_to_dataframe,
     report_df_size,
     save_dataframe_as_csv,
     add_rdkit_properties,
+)
+
+from .filters import (
     filter_Veber,
     filter_BrenkPAINS,
 )
@@ -23,15 +32,8 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-# _stage_cache replaced by _checkpoint (CheckpointManager)
-
-from ._checkpoint import (
+from .pipeline import (
     CheckpointManager,
-    _get_checkpoint,
-    _get_stage_dir,
-)
-
-from ._pipeline import (
     stage_path,
     checkpoint_path,
     rejected_path,
@@ -41,27 +43,27 @@ from ._pipeline import (
     save_dataframe,
 )
 
-__version__ = "4.10" # Month.Day, revised on 2026-04-10
+__version__ = "4.10"
 __author__ = "Dario M Lorente"
 
 __all__ = [
-    # Chemistry
+    # Reactions
     "rxn_ErlenmeyerPlochl",
     "rxn_AminolysisGFPc",
     "rxn_SulphurExchange",
-    # DataFrames
+    # I/O
     "sdf_to_dataframe",
     "report_df_size",
     "save_dataframe_as_csv",
     "add_rdkit_properties",
+    # Filters
     "filter_Veber",
     "filter_BrenkPAINS",
     # Enamine API
     "EnamineClient",
     "add_enamine_prices",
-    # Checkpoint
-    "CheckpointManager",
     # Pipeline
+    "CheckpointManager",
     "stage_path",
     "checkpoint_path",
     "rejected_path",

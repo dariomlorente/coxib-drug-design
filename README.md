@@ -37,9 +37,9 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 
 | Path | Description |
 |------|-------------|
-| `py_utils/` | Python package: reactions, filters, I/O, pricing client |
-| `py_utils/_checkpoint.py` | Checkpoint management for robust resume support |
-| `py_utils/_pipeline.py` | Stage paths + load/resume orchestration |
+| `py_utils/` | Python package: reactions, filters, I/O, pricing, pipeline |
+| `py_utils/_utils.py` | Hardware resources + caching helpers (private) |
+| `py_utils/_smarts_catalog.py` | Brenk + PAINS structural alerts (private) |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization |

@@ -1,211 +1,84 @@
 from __future__ import annotations
 
-# DATAFRAMES
-# DataFrame operations: I/O, filters, and property calculations
-
-import gzip
-import hashlib
-import json
 import multiprocessing as mp
-import os
-import re
-from collections import Counter
-from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import Descriptors, Lipinski, MolToSmiles, SDWriter, rdMolDescriptors
-from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+from rdkit.Chem import Descriptors, Lipinski, rdMolDescriptors
 
-from py_utils._cache_utils import _get_cache_key, _load_cache, _save_cache
-from py_utils._resources import _get_n_workers
-
-
-# Cache directory for persistent storage
-DEFAULT_CACHE_DIR = Path("mol_files/3. Oxazolones/.cache")
-
-def sdf_to_dataframe(sdf_path: str, id_prefix: str, id_prop: str = "Catalog_ID") -> pd.DataFrame:
-
-    """
-    Read an SDF file and return a DataFrame with ID and SMILES columns.
-    
-    Extracts molecules from SDF, reads the specified ID property, and generates
-    SMILES strings. Removes duplicates based on Catalog_ID.
-    
-    Parameters:
-        sdf_path: Path to the SDF file
-        id_prefix: Prefix for generating IDs (e.g., 'A' for aldehydes, 'C' for carboxylic)
-        id_prop: Property name in SDF containing the catalog ID (default: "Catalog_ID")
-    
-    Returns:
-        DataFrame with columns: ID, Catalog_ID, SMILES
-    """
-    if not re.fullmatch(r"[A-Za-z]+", id_prefix):
-        raise ValueError("id_prefix must contain only letters (e.g. 'A', 'C', 'ALD').")
-    
-    rows = []
-    seen_ids = set()
-    
-    suppl = Chem.SDMolSupplier(sdf_path)
-    for mol in suppl:
-        if mol is None:
-            continue
-        
-        if not mol.HasProp(id_prop):
-            continue
-            
-        catalog_id = mol.GetProp(id_prop)
-        if catalog_id in seen_ids:
-            continue
-        
-        # Try to generate SMILES
-        try:
-            smi = Chem.MolToSmiles(mol)
-            if smi:
-                seen_ids.add(catalog_id)
-                rows.append({"Catalog_ID": catalog_id, "SMILES": smi})
-        except Exception:
-            continue
-    
-    if not rows:
-        raise ValueError(f"No valid molecules found in {sdf_path}")
-    
-    df = pd.DataFrame(rows)
-    df.insert(0, "ID", [f"{id_prefix}{i+1}" for i in range(len(df))])
-    
-    print(f"[SDF Reader] Loaded {len(df)} unique compounds from {sdf_path}")
-    return df
+from ._smarts_catalog import BRENK_ALERTS, PAINS_ALERTS
+from ._utils import _get_n_workers, _load_cache, _save_cache
 
 
-def report_df_size(df: pd.DataFrame, label: str = "") -> None:
-    """Print the number of rows in a DataFrame."""
-    prefix = f"[{label}] " if label else ""
-    print(f"{prefix}{len(df)} rows")
+_COMPILED_BRENK_PATTERNS: list[tuple[str, Chem.Mol | None]] | None = None
+_COMPILED_PAINS_PATTERNS: list[tuple[str, str, Chem.Mol | None]] | None = None
 
 
+def _compile_brenk_pains_patterns() -> tuple[
+    list[tuple[str, Chem.Mol | None]],
+    list[tuple[str, str, Chem.Mol | None]],
+]:
+    global _COMPILED_BRENK_PATTERNS, _COMPILED_PAINS_PATTERNS
+
+    if _COMPILED_BRENK_PATTERNS is not None and _COMPILED_PAINS_PATTERNS is not None:
+        return _COMPILED_BRENK_PATTERNS, _COMPILED_PAINS_PATTERNS
+
+    compiled_brenk: list[tuple[str, Chem.Mol | None]] = []
+    for alert_name, smarts in BRENK_ALERTS.items():
+        patt = Chem.MolFromSmarts(smarts)
+        compiled_brenk.append((alert_name, patt))
+
+    compiled_pains: list[tuple[str, str, Chem.Mol | None]] = []
+    for pains_class, smarts_dict in PAINS_ALERTS.items():
+        for filter_name, smarts in smarts_dict.items():
+            patt = Chem.MolFromSmarts(smarts)
+            compiled_pains.append((pains_class, filter_name, patt))
+
+    _COMPILED_BRENK_PATTERNS = compiled_brenk
+    _COMPILED_PAINS_PATTERNS = compiled_pains
+
+    return compiled_brenk, compiled_pains
 
 
+def _process_brenk_pains_batch(
+    batch_items: list[tuple[int, str, bool]],
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
+    compiled_brenk, compiled_pains = _compile_brenk_pains_patterns()
 
-def save_dataframe_as_csv(
-    df: pd.DataFrame,
-    output_base_path: str,
-    columns: list[str] | None = None,
-    rename_map: dict[str, str] | None = None,
-) -> None:
-    """Save a DataFrame to CSV using format: <path>_<N>cmpds.csv
+    brenk_results: dict[int, tuple[str, str]] = {}
+    pains_results: dict[int, tuple[str, str]] = {}
 
-    Parameters:
-        df: Input DataFrame to save.
-        output_base_path: Path prefix (without extension); row count is appended automatically.
-        columns: If provided, only these columns are written (in this order).
-        rename_map: If provided, rename columns before writing (applied after column selection).
-    """
-    out = df[columns] if columns is not None else df
-    if rename_map is not None:
-        out = out.rename(columns=rename_map)
-    n_rows = len(out)
-    directory = os.path.dirname(output_base_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    output_path = f"{output_base_path}_{n_rows}cmpds.csv"
-    out.to_csv(output_path, index=False)
-    print(f"Saved {n_rows} compounds to: {output_path}")
-
-
-def _process_descriptors_batch(
-    batch_items: list[tuple[int, str]],
-) -> list[tuple[int, dict]]:
-    """Worker function for parallel descriptor calculation."""
-    results = []
-    for idx, smi in batch_items:
+    for idx, smi, process_pains in batch_items:
         mol = Chem.MolFromSmiles(smi)
         if mol is None:
+            brenk_results[idx] = ("invalid_smiles", "")
+            pains_results[idx] = ("invalid_smiles", "")
             continue
-        try:
-            Chem.SanitizeMol(mol)
-            desc = {
-                "MW": Descriptors.MolWt(mol),
-                "HBD": Lipinski.NumHDonors(mol),
-                "HBA": Lipinski.NumHAcceptors(mol),
-                "RotB": Lipinski.NumRotatableBonds(mol),
-                "HvyAtm": mol.GetNumHeavyAtoms(),
-                "Rings": rdMolDescriptors.CalcNumRings(mol),
-                "HetAtm": rdMolDescriptors.CalcNumHeteroatoms(mol),
-                "MR": Descriptors.MolMR(mol),
-                "CAtm": sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 6),
-                "Atoms": mol.GetNumAtoms(),
-                "tPSA": Descriptors.TPSA(mol),
-                "LogP": Descriptors.MolLogP(mol),
-            }
-            results.append((idx, desc))
-        except Exception:
-            pass
-    return results
 
+        matched_brenk = False
+        for alert_name, patt in compiled_brenk:
+            if patt and mol.HasSubstructMatch(patt):
+                brenk_results[idx] = ("Brenk", alert_name)
+                matched_brenk = True
+                break
+        if not matched_brenk:
+            brenk_results[idx] = ("", "")
 
-def add_rdkit_properties(
-    df: pd.DataFrame,
-    n_workers: int | None = None,
-) -> pd.DataFrame:
-    """Add RDKit descriptors (MW, HBD, HBA, RotB, HvyAtm, Rings, CAtm, HetAtm, MR, Atoms, tPSA, LogP) to DataFrame.
-    
-    Parameters:
-        df: Input DataFrame with SMILES column
-        n_workers: Number of parallel workers (default: cpu_count - 1)
-    
-    Returns:
-        DataFrame with added descriptor columns
-    """
-    if "SMILES" not in df.columns:
-        raise ValueError("Input DataFrame must contain a 'SMILES' column.")
-
-    out = df.copy()
-    
-    # Create list of (index, smiles) tuples for valid molecules
-    valid_items: list[tuple[int, str]] = []
-    invalid_indices: list[int] = []
-    
-    for idx, smi in enumerate(out["SMILES"].astype(str)):
-        if smi and smi != "nan":
-            valid_items.append((idx, smi))
+        if process_pains and brenk_results[idx][0] == "":
+            matched_pains = False
+            for pains_class, filter_name, patt in compiled_pains:
+                if patt and mol.HasSubstructMatch(patt):
+                    pains_results[idx] = (f"PAINS({pains_class})", filter_name)
+                    matched_pains = True
+                    break
+            if not matched_pains:
+                pains_results[idx] = ("", "")
         else:
-            invalid_indices.append(idx)
-    
-    if invalid_indices:
-        removed = out.loc[invalid_indices, ["ID", "SMILES"]]
-        print(f"⚠️  Removed {len(removed)} invalid SMILES rows")
-    
-    out = out.loc[~out.index.isin(invalid_indices)].reset_index(drop=True)
-    
-    # Prepare batches for multiprocessing
-    n_workers = _get_n_workers(n_workers)
-    batch_size = max(1, len(valid_items) // (n_workers * 10)) if len(valid_items) >= 1000 and n_workers > 1 else len(valid_items)
-    batches = [
-        valid_items[i:i + batch_size]
-        for i in range(0, len(valid_items), batch_size)
-    ]
-    
-    # Process in parallel or sequentially
-    if len(valid_items) >= 1000 and n_workers > 1:
-        with mp.Pool(processes=n_workers) as pool:
-            all_results = pool.map(_process_descriptors_batch, batches)
-        
-        # Flatten results
-        results: list[tuple[int, dict]] = []
-        for batch_result in all_results:
-            results.extend(batch_result)
-    else:
-        results = _process_descriptors_batch(valid_items)
-    
-    # Add descriptors to DataFrame
-    results_dict = {idx: desc for idx, desc in results}
-    
-    for col in ["MW", "HBD", "HBA", "RotB", "HvyAtm", "Rings", "HetAtm", "MR", "CAtm", "Atoms", "tPSA", "LogP"]:
-        out[col] = [results_dict.get(idx, {}).get(col, None) for idx in range(len(out))]
-    
-    return out
+            pains_results[idx] = ("", "")
+
+    return brenk_results, pains_results
 
 
 def filter_Veber(
@@ -235,12 +108,13 @@ def filter_Veber(
     output_csv: Path | str | None = None,
     filter_chunk_size: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Filter DataFrame by Veber bioavailability criteria.
+    """
+    Filter DataFrame by Veber bioavailability criteria.
 
     Only calculates and checks each property when the corresponding limit is
     explicitly provided. Comparisons are inclusive (<= / >=) for all criteria
     except min_CAtm and min_HetAtm, which are exclusive (strictly >).
-    LogP is calculated using Crippen's contribution-based method (Descriptors.MolLogP).
+    LogP is calculated using Crippen's contribution-based method.
 
     For large datasets (>1M rows), use output_csv with filter_chunk_size to stream
     results to disk and avoid memory exhaustion.
@@ -263,41 +137,27 @@ def filter_Veber(
         min_CAtm: Carbon atom count lower limit (exclusive, strictly >).
         min_HetAtm: Heteroatom count lower limit (exclusive, strictly >).
         max_price_mol: Price-per-molecule upper limit (inclusive).
-        recompute_descriptors: If True, drop existing descriptor columns and
-            recompute required ones from SMILES.
+        recompute_descriptors: Drop existing descriptor columns and recompute.
         smiles_col: Column name for SMILES strings.
         id_col: Column name for compound IDs.
         print_report: Print acceptance/rejection summary.
         use_cache: Use persistent cache for calculated properties.
         cache_file: Cache file path (auto-generated if None).
-        output_csv: If provided, stream accepted rows to this CSV file instead of
-            holding them in memory (recommended for >1M rows).
-        filter_chunk_size: Chunk size for filtering when output_csv is used.
-            If None, defaults to 100000. Set smaller for very large datasets.
+        output_csv: If provided, stream accepted rows to this CSV.
+        filter_chunk_size: Chunk size for streaming when output_csv is used.
+            Defaults to 100,000.
 
     Returns:
-        Tuple of (accepted, rejected) DataFrames. When output_csv is used,
-        accepted DataFrame is empty (data is on disk).
+        Tuple of (accepted, rejected) DataFrames.
     """
     required_base_cols = [id_col, smiles_col, "PriceMol"]
     missing_base_cols = [col for col in required_base_cols if col not in df.columns]
     if missing_base_cols:
-        missing_text = ", ".join(missing_base_cols)
-        raise ValueError(f"Missing required columns for filter_Veber: {missing_text}")
+        raise ValueError(f"Missing required columns for filter_Veber: {', '.join(missing_base_cols)}")
 
     descriptor_cols = {
-        "MW",
-        "HBD",
-        "HBA",
-        "RotB",
-        "HvyAtm",
-        "Rings",
-        "HetAtm",
-        "MR",
-        "CAtm",
-        "Atoms",
-        "tPSA",
-        "LogP",
+        "MW", "HBD", "HBA", "RotB", "HvyAtm", "Rings", "HetAtm",
+        "MR", "CAtm", "Atoms", "tPSA", "LogP",
     }
 
     df_work = df.copy()
@@ -310,35 +170,21 @@ def filter_Veber(
             )
         df_work = df_work.drop(columns=stale_cols, errors="ignore")
 
-    # --- Load cache if caching is enabled ---
     cache: dict[str, dict] = {}
-    cache_hits = 0
-    cache_misses = 0
 
     if use_cache:
         if cache_file is None:
             cache_file = Path("mol_files/3. Oxazolones/.cache/veber_filter_cache.json.gz")
         else:
             cache_file = Path(cache_file)
-
         cache = _load_cache(cache_file)
     else:
         cache_file = Path("/dev/null")
 
     if recompute_descriptors:
         required_descriptor_cols = [
-            "MW",
-            "HBD",
-            "HBA",
-            "RotB",
-            "HvyAtm",
-            "Rings",
-            "HetAtm",
-            "MR",
-            "CAtm",
-            "Atoms",
-            "tPSA",
-            "LogP",
+            "MW", "HBD", "HBA", "RotB", "HvyAtm", "Rings", "HetAtm",
+            "MR", "CAtm", "Atoms", "tPSA", "LogP",
         ]
     else:
         required_descriptor_cols: list[str] = []
@@ -408,6 +254,9 @@ def filter_Veber(
         for col in descriptor_calculators:
             df_work[col] = 0 if col in zero_default_cols else None
 
+        cache_hits = 0
+        cache_misses = 0
+
         for chunk_idx, chunk_start in enumerate(range(0, n_rows, chunk_size)):
             chunk_end = min(chunk_start + chunk_size, n_rows)
 
@@ -449,7 +298,7 @@ def filter_Veber(
                         cache[smi][col] = value
                     cache_misses += 1
 
-                df_work.loc[chunk_start:chunk_end - 1, col] = values
+                df_work.loc[chunk_start : chunk_end - 1, col] = values
 
             if use_cache and cache and (chunk_idx + 1) % 100 == 0:
                 _save_cache(cache_file, cache)
@@ -459,12 +308,8 @@ def filter_Veber(
 
     still_missing = [col for col in required_descriptor_cols if col not in df_work.columns]
     if still_missing:
-        missing_text = ", ".join(still_missing)
-        raise ValueError(f"Failed to compute required descriptor columns: {missing_text}")
+        raise ValueError(f"Failed to compute required descriptor columns: {', '.join(still_missing)}")
 
-    # --- Filtering (all inclusive ≤/≥, except min_CAtm and min_HetAtm which are strict >) ---
-    # Each criterion contributes a (bool_mask, label_series) pair.
-    # Labels are computed only for the failing subset to avoid unnecessary string work.
     criteria: list[tuple[pd.Series, pd.Series]] = []
 
     if max_tPSA is not None:
@@ -510,10 +355,10 @@ def filter_Veber(
         m = df_work["PriceMol"] > max_price_mol
         criteria.append((m, df_work.loc[m, "PriceMol"].map(lambda v: f"PriceMol={v:.2f}>{max_price_mol}")))
     if min_CAtm is not None:
-        m = df_work["CAtm"] <= min_CAtm  # exclusive
+        m = df_work["CAtm"] <= min_CAtm
         criteria.append((m, df_work.loc[m, "CAtm"].map(lambda v: f"CAtm={v}<={min_CAtm}")))
     if min_HetAtm is not None:
-        m = df_work["HetAtm"] <= min_HetAtm  # exclusive
+        m = df_work["HetAtm"] <= min_HetAtm
         criteria.append((m, df_work.loc[m, "HetAtm"].map(lambda v: f"HetAtm={v}<={min_HetAtm}")))
 
     if criteria:
@@ -530,62 +375,58 @@ def filter_Veber(
         rejection = pd.Series("", index=df_work.index)
 
     df_work["Rejection"] = rejection
-    
-    # --- Streaming output mode for large datasets ---
+
     if output_csv is not None:
         if filter_chunk_size is None:
             filter_chunk_size = 100000
-        
+
         output_path = Path(output_csv)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         n_rows = len(df_work)
         n_chunks = (n_rows + filter_chunk_size - 1) // filter_chunk_size
-        
+
         rejected_rows: list[dict] = []
-        
+
         if print_report:
             print(f"[Veber] Streaming accepted rows to {output_path}...")
-        
+
         for chunk_idx, chunk_start in enumerate(range(0, n_rows, filter_chunk_size)):
             chunk_end = min(chunk_start + filter_chunk_size, n_rows)
-            
+
             if print_report and (chunk_idx + 1) % 10 == 0:
                 print(f"[Veber] Processing filter chunk {chunk_idx + 1}/{n_chunks}...")
-            
+
             chunk = df_work.iloc[chunk_start:chunk_end]
-            
-            # Separate accepted and rejected
-            chunk_accepted = chunk[~chunk["Rejection"].astype(bool)].drop(columns=["Rejection"])
+
+            chunk_accepted = chunk[~chunk["Rejection"].astype(bool)].drop(
+                columns=["Rejection"]
+            )
             chunk_rejected = chunk[chunk["Rejection"].astype(bool)]
-            
-            # Stream accepted to CSV
+
             if len(chunk_accepted) > 0:
                 mode = "w" if chunk_idx == 0 else "a"
                 header = chunk_idx == 0
                 chunk_accepted.to_csv(output_path, mode=mode, index=False, header=header)
-            
-            # Collect rejected rows
+
             if len(chunk_rejected) > 0:
                 rejected_rows.extend(chunk_rejected.to_dict("records"))
-        
+
         df_rejected = pd.DataFrame(rejected_rows)
-        df_accepted = pd.DataFrame()  # Empty - data is on disk
-        
-        # Write rejected to CSV in cache directory
+        df_accepted = pd.DataFrame()
+
         if len(df_rejected) > 0:
             rej_path = output_path.parent / f"{output_path.stem}_rejected{output_path.suffix}"
             df_rejected.to_csv(rej_path, index=False)
-        
     else:
-        # Original behavior - return DataFrames in memory
         df_rejected = df_work[any_fail].copy().reset_index(drop=True)
         df_accepted = df_work[~any_fail].drop(columns=["Rejection"]).reset_index(drop=True)
-    
-    # Select only desired columns for rejected (Veber)
+
     if len(df_rejected) > 0:
-        # Keep only: ID, SMILES, PriceMol, tPSA, RotB, LogP, MW, HBD, HBA, Rejection
-        desired_cols = [id_col, smiles_col, "PriceMol", "tPSA", "RotB", "LogP", "MW", "HBD", "HBA", "Rejection"]
+        desired_cols = [
+            id_col, smiles_col, "PriceMol", "tPSA", "RotB", "LogP",
+            "MW", "HBD", "HBA", "Rejection",
+        ]
         existing_cols = [col for col in desired_cols if col in df_rejected.columns]
         df_rejected = df_rejected[existing_cols].reset_index(drop=True)
 
@@ -599,93 +440,8 @@ def filter_Veber(
             n_rejected = len(df_rejected)
         pct = (n_accepted / n_total * 100) if n_total > 0 else 0
         print(f"[filter_Veber] {n_accepted:,}/{n_total:,} accepted ({pct:.1f}%), {n_rejected:,} rejected")
-        if use_cache and (cache_hits > 0 or cache_misses > 0):
-            total_lookups = cache_hits + cache_misses
-            hit_rate = (cache_hits / total_lookups * 100) if total_lookups > 0 else 0
-            print(f"[filter_Veber] Cache: {cache_hits} hits, {cache_misses} misses ({hit_rate:.1f}% hit rate)")
 
     return df_accepted, df_rejected
-
-
-# Module-level cache for compiled SMARTS patterns (thread-safe, computed once)
-_COMPILED_BRENK_PATTERNS: list[tuple[str, Chem.Mol | None]] | None = None
-_COMPILED_PAINS_PATTERNS: list[tuple[str, str, Chem.Mol | None]] | None = None
-
-
-def _compile_brenk_pains_patterns() -> tuple[
-    list[tuple[str, Chem.Mol | None]], 
-    list[tuple[str, str, Chem.Mol | None]]
-]:
-    """Compile Brenk and PAINS SMARTS patterns once and cache at module level."""
-    global _COMPILED_BRENK_PATTERNS, _COMPILED_PAINS_PATTERNS
-    
-    if _COMPILED_BRENK_PATTERNS is not None and _COMPILED_PAINS_PATTERNS is not None:
-        return _COMPILED_BRENK_PATTERNS, _COMPILED_PAINS_PATTERNS
-    
-    from py_utils._smarts_catalog import BRENK_ALERTS, PAINS_ALERTS
-    
-    compiled_brenk: list[tuple[str, Chem.Mol | None]] = []
-    for alert_name, smarts in BRENK_ALERTS.items():
-        patt = Chem.MolFromSmarts(smarts)
-        compiled_brenk.append((alert_name, patt))
-    
-    compiled_pains: list[tuple[str, str, Chem.Mol | None]] = []
-    for pains_class, smarts_dict in PAINS_ALERTS.items():
-        for filter_name, smarts in smarts_dict.items():
-            patt = Chem.MolFromSmarts(smarts)
-            compiled_pains.append((pains_class, filter_name, patt))
-    
-    _COMPILED_BRENK_PATTERNS = compiled_brenk
-    _COMPILED_PAINS_PATTERNS = compiled_pains
-    
-    return compiled_brenk, compiled_pains
-
-
-def _process_brenk_pains_batch(
-    batch_items: list[tuple[int, str, bool]],
-    n_workers: int = 1,
-) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]]:
-    """Worker function for parallel Brenk and PAINS filtering.
-    
-    batch_items: list of (index, smiles, process_pains) tuples
-    """
-    # Use cached compiled patterns (compiled once at module level)
-    compiled_brenk, compiled_pains = _compile_brenk_pains_patterns()
-    
-    brenk_results: dict[int, tuple[str, str]] = {}
-    pains_results: dict[int, tuple[str, str]] = {}
-    
-    for idx, smi, process_pains in batch_items:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            brenk_results[idx] = ("invalid_smiles", "")
-            pains_results[idx] = ("invalid_smiles", "")
-            continue
-        
-        # Brenk filtering
-        matched_brenk = False
-        for alert_name, patt in compiled_brenk:
-            if patt and mol.HasSubstructMatch(patt):
-                brenk_results[idx] = ("Brenk", alert_name)
-                matched_brenk = True
-                break
-        if not matched_brenk:
-            brenk_results[idx] = ("", "")
-        
-        # PAINS filtering (only if passed Brenk)
-        if process_pains and brenk_results[idx][0] == "":
-            matched_pains = False
-            for pains_class, filter_name, patt in compiled_pains:
-                if patt and mol.HasSubstructMatch(patt):
-                    pains_results[idx] = (f"PAINS({pains_class})", filter_name)
-                    matched_pains = True
-                    break
-            if not matched_pains:
-                pains_results[idx] = ("", "")
-        else:
-            pains_results[idx] = ("", "")
-    
-    return brenk_results, pains_results
 
 
 def filter_BrenkPAINS(
@@ -695,32 +451,26 @@ def filter_BrenkPAINS(
     print_report: bool = True,
     n_workers: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Filter out compounds containing Brenk structural alerts or PAINS substructures.
+    """
+    Filter out compounds containing Brenk structural alerts or PAINS substructures.
 
     Two-stage filter:
       1. **Brenk alerts** — functional groups associated with poor ADMET or
-         mutagenicity (Brenk et al., J. Chem. Inf. Model. 2008).
+         mutagenicity (Brenk et al., ChemMedChem 2008).
       2. **PAINS** — pan-assay interference compounds (Baell & Holloway,
          J. Med. Chem. 2010). Organized by class (a, b, c).
 
-    Rejected compounds get two extra columns in the rejected DataFrame:
-      - MatchAlert: "Brenk", "PAINS(a)", "PAINS(b)", "PAINS(c)", or "invalid_smiles"
-      - Substructure: the specific alert/filter name that matched
-
-    Molecules that fail to parse are marked as "invalid_smiles".
+    Rejected compounds get two extra columns: MatchAlert and Substructure.
 
     Parameters:
-        df: Input DataFrame — must contain ``smiles_col`` and ``id_col``.
-        smiles_col: Column containing SMILES strings (default: ``"SMILES"``).
-        id_col: Column containing compound IDs (default: ``"ID"``).
-        print_report: Print acceptance/rejection summary (default: True).
+        df: Input DataFrame with ``smiles_col`` and ``id_col``.
+        smiles_col: Column containing SMILES strings.
+        id_col: Column containing compound IDs.
+        print_report: Print acceptance/rejection summary.
         n_workers: Number of parallel workers (default: cpu_count - 1).
 
     Returns:
         Tuple of (accepted, rejected) DataFrames.
-
-    Raises:
-        ValueError: If required columns are missing.
     """
     if smiles_col not in df.columns:
         raise ValueError(f"Missing column '{smiles_col}'.")
@@ -728,68 +478,67 @@ def filter_BrenkPAINS(
         raise ValueError(f"Missing column '{id_col}'.")
 
     out_df = df.copy()
-    
-    # Prepare items for parallel processing
+
     smiles_list = out_df[smiles_col].astype(str).tolist()
-    
-    # Stage 1: Brenk filtering with multiprocessing
+
     n_workers = _get_n_workers(n_workers)
-    
-    # Create batch items - include flag for whether to process PAINS (will be determined later)
+
     items = [(i, smi, True) for i, smi in enumerate(smiles_list)]
-    
-    # Split into batches
+
     if len(items) >= 1000 and n_workers > 1:
         batch_size = max(1, len(items) // (n_workers * 10))
-        batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
-        
+        batches = [
+            items[i : i + batch_size]
+            for i in range(0, len(items), batch_size)
+        ]
+
         with mp.Pool(processes=n_workers) as pool:
             results = pool.map(_process_brenk_pains_batch, batches)
-        
-        # Merge results from all batches
+
         brenk_results: dict[int, tuple[str, str]] = {}
         pains_results: dict[int, tuple[str, str]] = {}
-        
+
         for batch_brenk, batch_pains in results:
             brenk_results.update(batch_brenk)
             pains_results.update(batch_pains)
     else:
-        # Sequential processing for small datasets
         brenk_results, pains_results = _process_brenk_pains_batch(items)
-    
-    # Apply results to DataFrame
+
     out_df["MatchAlert"] = [brenk_results.get(i, ("", ""))[0] for i in range(len(out_df))]
     out_df["Substructure"] = [brenk_results.get(i, ("", ""))[1] for i in range(len(out_df))]
-    
-    # Keep accepted Brenk compounds for PAINS filtering
+
     brenk_accepted = out_df[out_df["MatchAlert"] == ""].copy()
     brenk_rejected = out_df[out_df["MatchAlert"] != ""].copy()
-    
-    # Apply PAINS results to Brenk-accepted compounds
+
     pains_match_alerts: list[str] = []
     pains_substructures: list[str] = []
-    
+
     for idx in brenk_accepted.index:
         pains_result = pains_results.get(idx, ("", ""))
         pains_match_alerts.append(pains_result[0])
         pains_substructures.append(pains_result[1])
-    
+
     brenk_accepted["MatchAlert"] = pains_match_alerts
     brenk_accepted["Substructure"] = pains_substructures
-    
-    # Final results
+
     pains_rejected = brenk_accepted[brenk_accepted["MatchAlert"] != ""].copy()
     pains_accepted = brenk_accepted[brenk_accepted["MatchAlert"] == ""].copy()
-    
-    # Combine rejected from both stages
-    df_rejected = pd.concat([brenk_rejected, pains_rejected], ignore_index=True)
-    df_accepted = pains_accepted.drop(columns=["MatchAlert", "Substructure"]).reset_index(drop=True)
+
+    df_rejected = (
+        pd.concat([brenk_rejected, pains_rejected], ignore_index=True)
+        .reset_index(drop=True)
+    )
+    df_accepted = (
+        pains_accepted.drop(columns=["MatchAlert", "Substructure"])
+        .reset_index(drop=True)
+    )
     df_rejected = df_rejected.reset_index(drop=True)
-    
-    # Select only desired columns for rejected (Brenk+PAINS)
+
     if len(df_rejected) > 0:
-        # Keep only: ID, SMILES, PriceMol, tPSA, RotB, LogP, MW, HBD, HBA, MatchAlert, Substructure
-        desired_cols = ["ID", "SMILES", "PriceMol", "tPSA", "RotB", "LogP", "MW", "HBD", "HBA", "MatchAlert", "Substructure"]
+        desired_cols = [
+            "ID", "SMILES", "PriceMol", "tPSA", "RotB", "LogP",
+            "MW", "HBD", "HBA", "MatchAlert", "Substructure",
+        ]
         existing_cols = [col for col in desired_cols if col in df_rejected.columns]
         df_rejected = df_rejected[existing_cols].reset_index(drop=True)
 

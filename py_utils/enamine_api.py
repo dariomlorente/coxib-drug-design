@@ -431,47 +431,39 @@ def add_enamine_prices(
         if cached_count > 0:
             print(f"[Enamine Pricing] Using cache for {cached_count} compounds")
         print(f"[Enamine Pricing] Querying {len(ids_to_query)} compounds via API")
-        print(f"[Enamine Pricing] Filters: <= {max_price_per_gram} EUR/g, <= {max_pack_price} EUR/pack")
     
     new_valid_prices: dict[str, dict[str, Any]] = {}
     new_invalid_compounds: set[str] = set()
     
     if ids_to_query:
-        n_batches = (len(ids_to_query) + batch_size - 1) // batch_size
-        
         for i in range(0, len(ids_to_query), batch_size):
             batch = ids_to_query[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            
-            if print_report:
-                print(f"[Enamine Pricing] Batch {batch_num}/{n_batches}: {len(batch)} compounds")
-            
             try:
                 data = client.fetch_batch(batch)
-                
+
                 if data:
                     batch_results = _extract_prices_from_batch_response(data)
-                    
+
                     for compound_id in batch:
                         packs = batch_results.get(compound_id, [])
-                        
+
                         if packs:
                             best_pack = _find_best_pack(
                                 packs, max_price_per_gram, max_pack_price
                             )
-                            
+
                             if best_pack:
                                 new_valid_prices[compound_id] = best_pack
                             else:
                                 new_invalid_compounds.add(compound_id)
                         else:
                             new_invalid_compounds.add(compound_id)
-                
+
                 time.sleep(API_REQUEST_DELAY)
-                
+
             except Exception as e:
                 if print_report:
-                    print(f"⚠️ Error in batch {batch_num}: {e}")
+                    print(f"⚠️ Error in batch: {e}")
                 for cid in batch:
                     new_invalid_compounds.add(cid)
     
@@ -520,8 +512,6 @@ def add_enamine_prices(
             "invalid": final_invalid_cache
         }
         _save_cache(cache_file, cache_to_save)
-        if print_report:
-            print(f"[Enamine Pricing] Saved {len(final_valid_cache)} valid + {len(final_invalid_cache)} invalid to cache")
     
     initial_count = len(out_df)
     valid_mask = out_df["PriceG"].notna() & (out_df["PriceG"] > 0)
