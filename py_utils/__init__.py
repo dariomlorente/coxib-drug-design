@@ -7,6 +7,7 @@ Modules:
   - filters   : filter_Veber, filter_BrenkPAINS
   - enamine_api: EnamineClient, add_enamine_prices
   - pipeline  : CheckpointManager, load_or_run, load_or_filter, paths
+  - phase2_hit_prioritization: Phase 2 QED + prioritization helpers
 """
 
 from .reactions import (
@@ -43,7 +44,20 @@ from .pipeline import (
     save_dataframe,
 )
 
-__version__ = "4.10"
+from .phase2_hit_prioritization import (
+    find_latest_stage_csv,
+    load_generated_product_sets,
+    ensure_required_bioavailability_columns,
+    add_qed_column,
+    load_or_compute_qed,
+    filter_bioavailability,
+    save_bioavailability_outputs,
+    apply_price_controls,
+    save_price_control_outputs,
+    plot_qed_histograms,
+)
+
+__version__ = "4.17"
 __author__ = "Dario M Lorente"
 
 __all__ = [
@@ -71,4 +85,15 @@ __all__ = [
     "load_or_run",
     "load_or_filter",
     "save_dataframe",
+    # Phase 2
+    "find_latest_stage_csv",
+    "load_generated_product_sets",
+    "ensure_required_bioavailability_columns",
+    "add_qed_column",
+    "load_or_compute_qed",
+    "filter_bioavailability",
+    "save_bioavailability_outputs",
+    "apply_price_controls",
+    "save_price_control_outputs",
+    "plot_qed_histograms",
 ]

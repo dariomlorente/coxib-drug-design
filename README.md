@@ -17,7 +17,7 @@ Cyclooxygenase-2 (COX-2) selective inhibitors are a class of non-steroidal anti-
 ## Installation
 
 ```bash
-conda env create -f env.yaml
+conda env create -f env.yml
 conda activate coxibs
 ```
 
@@ -44,7 +44,8 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization |
 | `03_activity_prediction.ipynb` | Phase 3: *In silico* activity prediction |
-| `env.yaml` | Conda environment specification |
+| `py_utils/phase2_hit_prioritization.py` | Phase 2 helper module (QED + bioavailability + price controls + plots) |
+| `env.yml` | Conda environment specification |
 
 ## File Naming Convention
 
@@ -86,6 +87,30 @@ If the kernel crashes, re-running the notebook will:
 2. Skip already-processed aldehydes/oxazolones (tracked by IDs)
 3. Resume from the last completed chunk
 4. Continue until completion
+
+## Phase 2 Outputs (Hit Prioritization)
+
+Notebook `02_hit_prioritization.ipynb` loads Phase 1 products (`*_brenkpains_*cmpds.csv`),
+adds QED, applies a composite bioavailability filter (Lipinski, Ghose, Egan, Muegge,
+Veber) with a **4/5 pass threshold**, exports phase-2 accepted/rejected sets under
+`mol_files/6. QED/`, then applies a sequential price re-filtering stage for clustering
+input (`max_price` -> `acceptance_rate` -> `max_sample_size`).
+
+Output paths:
+
+- Accepted imidazolones: `mol_files/6. QED/Imidazolones_{N}cmpds.csv`
+- Accepted thiazolones: `mol_files/6. QED/Thiazolones_{N}cmpds.csv`
+- Rejected imidazolones: `mol_files/6. QED/.rejected/Imidazolones_rejected_bioavailability_{N}cmpds.csv`
+- Rejected thiazolones: `mol_files/6. QED/.rejected/Thiazolones_rejected_bioavailability_{N}cmpds.csv`
+
+The `Violation` column is inserted after `QED` and stores violated rule names.
+
+Clustering-input outputs:
+
+- Accepted imidazolones: `mol_files/7. Clustering/Imidazolones_input_{N}cmpds.csv`
+- Accepted thiazolones: `mol_files/7. Clustering/Thiazolones_input_{N}cmpds.csv`
+- Rejected imidazolones: `mol_files/7. Clustering/.rejected/Imidazolones_rejected_pricectrl_{N}cmpds.csv`
+- Rejected thiazolones: `mol_files/7. Clustering/.rejected/Thiazolones_rejected_pricectrl_{N}cmpds.csv`
 
 ## Author
 

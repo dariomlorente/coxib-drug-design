@@ -28,6 +28,8 @@ mol_files/2. Building Blocks/
 mol_files/3. Oxazolones/
 mol_files/4. Imidazolones/
 mol_files/5. Thiazolones/
+mol_files/6. QED/
+mol_files/7. Clustering/
 *.smi
 *_ACCEPTED_*.csv
 *_REJECTED_*.csv
