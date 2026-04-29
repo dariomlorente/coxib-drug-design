@@ -12,6 +12,7 @@ Cyclooxygenase-2 (COX-2) selective inhibitors are a class of non-steroidal anti-
 
 - Python 3.10+
 - Conda (recommended for environment management)
+- ALMOS CLI (`almos-kit`) available in the execution environment for the ALMOS clustering stage
 - Enamine Store API credentials (optional — required for real-time compound pricing)
 
 ## Installation
@@ -42,9 +43,11 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 | `py_utils/_smarts_catalog.py` | Brenk + PAINS structural alerts (private) |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
-| `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization |
+| `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |
 | `03_activity_prediction.ipynb` | Phase 3: *In silico* activity prediction |
-| `py_utils/phase2_hit_prioritization.py` | Phase 2 helper module (QED + bioavailability + price controls + plots) |
+| `py_utils/ultrafilter.py` | Phase 2 helper module (QED + bioavailability + price controls + plots) |
+| `py_utils/clustering.py` | Phase 3 helper module (ALMOS clustering + representatives + exports) |
+| `AI-workshops/Sessions/Session_7_Clustering/chemical_space_session.ipynb` | ALMOS workshop notebook (optional reference) |
 | `env.yml` | Conda environment specification |
 
 ## File Naming Convention
@@ -93,8 +96,9 @@ If the kernel crashes, re-running the notebook will:
 Notebook `02_hit_prioritization.ipynb` loads Phase 1 products (`*_brenkpains_*cmpds.csv`),
 adds QED, applies a composite bioavailability filter (Lipinski, Ghose, Egan, Muegge,
 Veber) with a **4/5 pass threshold**, exports phase-2 accepted/rejected sets under
-`mol_files/6. QED/`, then applies a sequential price re-filtering stage for clustering
-input (`max_price` -> `acceptance_rate` -> `max_sample_size`).
+`mol_files/6. QED/`, applies a sequential price re-filtering stage for clustering input
+(`max_price` -> `acceptance_rate` -> `max_sample_size`), and then runs ALMOS clustering
+for both series in the final notebook section.
 
 Output paths:
 
@@ -107,10 +111,43 @@ The `Violation` column is inserted after `QED` and stores violated rule names.
 
 Clustering-input outputs:
 
-- Accepted imidazolones: `mol_files/7. Clustering/Imidazolones_input_{N}cmpds.csv`
-- Accepted thiazolones: `mol_files/7. Clustering/Thiazolones_input_{N}cmpds.csv`
+- Accepted imidazolones: `mol_files/7. Clustering/.inputs/Imidazolones_input_{N}cmpds.csv`
+- Accepted thiazolones: `mol_files/7. Clustering/.inputs/Thiazolones_input_{N}cmpds.csv`
 - Rejected imidazolones: `mol_files/7. Clustering/.rejected/Imidazolones_rejected_pricectrl_{N}cmpds.csv`
 - Rejected thiazolones: `mol_files/7. Clustering/.rejected/Thiazolones_rejected_pricectrl_{N}cmpds.csv`
+
+## ALMOS Clustering Outputs
+
+ALMOS clustering consumes the Phase 2 clustering-input files and runs independently for
+imidazolones and thiazolones. The canonical execution entrypoint is now the ALMOS section
+inside `02_hit_prioritization.ipynb`, backed by `py_utils/clustering.py` (same pipeline stage).
+
+Implementation note: ALMOS requires a unique `--name` column. If `ID` contains duplicates,
+the helper module auto-generates a temporary unique name column (`ALMOS_ID`) for the ALMOS
+run and maps cluster labels back to the original rows.
+
+Run-level outputs are written to `mol_files/7. Clustering/ALMOS/`:
+
+- Representatives (one per cluster, simplified for discussion):
+  - `mol_files/7. Clustering/Imidazolones_{K}_samples.csv`
+  - `mol_files/7. Clustering/Thiazolones_{K}_samples.csv`
+- Full clustered imidazolones: `mol_files/7. Clustering/ALMOS/Imidazolones_clusters_k{K}_{N}cmpds.csv`
+- Full clustered thiazolones: `mol_files/7. Clustering/ALMOS/Thiazolones_clusters_k{K}_{N}cmpds.csv`
+- Representatives (with ALMOS metadata):
+  - `mol_files/7. Clustering/ALMOS/Imidazolones_representatives_k{K}_{K}cmpds.csv`
+  - `mol_files/7. Clustering/ALMOS/Thiazolones_representatives_k{K}_{K}cmpds.csv`
+- Top-N shortlist for group discussion:
+  - `mol_files/7. Clustering/ALMOS/Imidazolones_shortlist_top{T}_k{K}_{M}cmpds.csv`
+  - `mol_files/7. Clustering/ALMOS/Thiazolones_shortlist_top{T}_k{K}_{M}cmpds.csv`
+- Cluster summary tables:
+  - `mol_files/7. Clustering/ALMOS/Imidazolones_cluster_summary_k{K}.csv`
+  - `mol_files/7. Clustering/ALMOS/Thiazolones_cluster_summary_k{K}.csv`
+- Run metadata JSON:
+  - `mol_files/7. Clustering/ALMOS/Imidazolones_cluster_run_k{K}_{N}cmpds.json`
+  - `mol_files/7. Clustering/ALMOS/Thiazolones_cluster_run_k{K}_{N}cmpds.json`
+
+The metadata JSON stores command-line parameters, input SHA256, selected ALMOS outputs,
+and stdout/stderr log paths from the run folder under `mol_files/7. Clustering/ALMOS/.runs/`.
 
 ## Author
 

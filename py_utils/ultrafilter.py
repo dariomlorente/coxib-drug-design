@@ -702,7 +702,8 @@ def save_price_control_outputs(
     df_thiazolones_input: pd.DataFrame,
     df_imidazolones_rejected_pricectrl: pd.DataFrame,
     df_thiazolones_rejected_pricectrl: pd.DataFrame,
-    output_dir: str | Path = "mol_files/7. Clustering",
+    input_dir: str | Path = "mol_files/7. Clustering/.inputs",
+    rejected_dir: str | Path = "mol_files/7. Clustering/.rejected",
     print_report: bool = True,
 ) -> dict[str, Path]:
     """
@@ -718,8 +719,10 @@ def save_price_control_outputs(
         Rejected imidazolones from price controls.
     df_thiazolones_rejected_pricectrl
         Rejected thiazolones from price controls.
-    output_dir
-        Base directory for clustering stage outputs.
+    input_dir
+        Directory for accepted clustering inputs.
+    rejected_dir
+        Directory for rejected compounds.
     print_report
         Print saved paths.
 
@@ -728,15 +731,15 @@ def save_price_control_outputs(
     dict[str, Path]
         Output paths by dataset role.
     """
-    output_dir = Path(output_dir)
-    rejected_dir = output_dir / ".rejected"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    input_dir = Path(input_dir)
+    rejected_dir = Path(rejected_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
     rejected_dir.mkdir(parents=True, exist_ok=True)
 
     paths = {
-        "imidazolones_input": output_dir
+        "imidazolones_input": input_dir
         / f"Imidazolones_input_{len(df_imidazolones_input)}cmpds.csv",
-        "thiazolones_input": output_dir
+        "thiazolones_input": input_dir
         / f"Thiazolones_input_{len(df_thiazolones_input)}cmpds.csv",
         "imidazolones_rejected_pricectrl": rejected_dir
         / f"Imidazolones_rejected_pricectrl_{len(df_imidazolones_rejected_pricectrl)}cmpds.csv",
@@ -756,6 +759,66 @@ def save_price_control_outputs(
         print(f"[Save] {paths['thiazolones_rejected_pricectrl']}")
 
     return paths
+
+
+def run_clustering_input_export(
+    df_imidazolones_druglike: pd.DataFrame,
+    df_thiazolones_druglike: pd.DataFrame,
+    max_price_imi: float | None = None,
+    max_price_thi: float | None = None,
+    accept_rate_imi: float = 0.67,
+    accept_rate_thi: float = 0.67,
+    max_sample_imi: int = 30000,
+    max_sample_thi: int = 30000,
+) -> dict[str, Path]:
+    """
+    Run full clustering input export pipeline for both series.
+
+    Parameters
+    ----------
+    df_imidazolones_druglike
+        Accepted imidazolones from bioavailability filter.
+    df_thiazolones_druglike
+        Accepted thiazolones from bioavailability filter.
+    max_price_imi
+        Max price for imidazolones.
+    max_price_thi
+        Max price for thiazolones.
+    accept_rate_imi
+        Acceptance rate for imidazolones.
+    accept_rate_thi
+        Acceptance rate for thiazolones.
+    max_sample_imi
+        Max sample size for imidazolones.
+    max_sample_thi
+        Max sample size for thiazolones.
+
+    Returns
+    -------
+    dict[str, Path]
+        Paths with keys: imidazolones_input, thiazolones_input,
+        imidazolones_rejected_pricectrl, thiazolones_rejected_pricectrl.
+    """
+    df_imi_in, df_imi_rej = apply_price_controls(
+        df_imidazolones_druglike,
+        max_price=max_price_imi,
+        acceptance_rate=accept_rate_imi,
+        max_sample_size=max_sample_imi,
+    )
+    df_thi_in, df_thi_rej = apply_price_controls(
+        df_thiazolones_druglike,
+        max_price=max_price_thi,
+        acceptance_rate=accept_rate_thi,
+        max_sample_size=max_sample_thi,
+    )
+    return save_price_control_outputs(
+        df_imidazolones_input=df_imi_in,
+        df_thiazolones_input=df_thi_in,
+        df_imidazolones_rejected_pricectrl=df_imi_rej,
+        df_thiazolones_rejected_pricectrl=df_thi_rej,
+        input_dir="mol_files/7. Clustering/.inputs",
+        rejected_dir="mol_files/7. Clustering/.rejected",
+    )
 
 
 def plot_qed_histograms(
@@ -815,7 +878,7 @@ def plot_qed_histograms(
         ignore_index=True,
     ).dropna()
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
 
     axes[0].hist(
         qed_rejected,
