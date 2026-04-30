@@ -21,6 +21,8 @@ venv/
 mol_files/1. Enamine SDFs/EnamineBBStock_*.sdf 
 # TESTER SDFs (small, tracked)
 !mol_files/1. Enamine SDFs/TESTER_*.sdf
+# Purchased reagents (small, tracked)
+!mol_files/1. Enamine SDFs/Purchased_*.sdf
 
 # Generated/cache files (not tracked)
 mol_files/2. Building Blocks/price_cache/
@@ -30,7 +32,6 @@ mol_files/4. Imidazolones/
 mol_files/5. Thiazolones/
 mol_files/6. QED/
 mol_files/7. Clustering/
-*.smi
 *_ACCEPTED_*.csv
 *_REJECTED_*.csv
 Nacylglycines*.csv
@@ -41,5 +42,6 @@ Marketed_*.csv
 *.tmp
 *.temp
 
-# Development notes (local only)
+# Local notes
 *S.md
+*.xlsx

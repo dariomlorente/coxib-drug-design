@@ -42,11 +42,13 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 | `py_utils/_utils.py` | Hardware resources + caching helpers (private) |
 | `py_utils/_smarts_catalog.py` | Brenk + PAINS structural alerts (private) |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
+| `00_purchased_reagents.ipynb` | Phase 0: Purchased reagents (CAS -> Enamine SDF subsets) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |
 | `03_activity_prediction.ipynb` | Phase 3: *In silico* activity prediction |
 | `py_utils/ultrafilter.py` | Phase 2 helper module (QED + bioavailability + price controls + plots) |
 | `py_utils/clustering.py` | Phase 3 helper module (ALMOS clustering + representatives + exports) |
+| `py_utils/inventory.py` | Phase 0 helper module (CAS -> SMILES -> SDF subset) |
 | `AI-workshops/Sessions/Session_7_Clustering/chemical_space_session.ipynb` | ALMOS workshop notebook (optional reference) |
 | `env.yml` | Conda environment specification |
 

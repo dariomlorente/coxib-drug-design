@@ -9,6 +9,30 @@ from __future__ import annotations
 #   - pipeline: CheckpointManager, load_or_run, load_or_filter, paths
 #   - ultrafilter: Phase 2 QED + prioritization helpers
 #   - clustering: Phase 3 ALMOS clustering helpers
+#   - inventory: Phase 0 inventory helpers
+
+from .reactions import (
+    rxn_ErlenmeyerPlochl,
+    rxn_AminolysisGFPc,
+    rxn_SulphurExchange,
+)
+
+from .io import (
+    sdf_to_dataframe,
+    report_df_size,
+    save_dataframe_as_csv,
+    add_rdkit_properties,
+)
+
+from .filters import (
+    filter_Veber,
+    filter_BrenkPAINS,
+)
+
+from .enamine_api import (
+    EnamineClient,
+    add_enamine_prices,
+)
 
 from .ultrafilter import (
     find_latest_stage_csv,
@@ -43,7 +67,25 @@ from .clustering import (
     run_phase3_clustering,
 )
 
-__version__ = "4.29"
+from .inventory import (
+    load_inventory_cas,
+    cas_to_smiles,
+    filter_sdf_by_smiles,
+    plot_sdf_size_summary,
+)
+
+from .pipeline import (
+    CheckpointManager,
+    stage_path,
+    checkpoint_path,
+    rejected_path,
+    init_stage_dirs,
+    load_or_run,
+    load_or_filter,
+    save_dataframe,
+)
+
+__version__ = "4.30" #Month.Day
 __author__ = "Dario M Lorente"
 
 __all__ = [
@@ -100,4 +142,9 @@ __all__ = [
     "cluster_with_almos",
     "cluster_inputs",
     "run_phase3_clustering",
+    # Phase 0
+    "load_inventory_cas",
+    "cas_to_smiles",
+    "filter_sdf_by_smiles",
+    "plot_sdf_size_summary",
 ]
