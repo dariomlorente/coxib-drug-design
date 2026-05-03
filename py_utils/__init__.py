@@ -74,6 +74,19 @@ from .inventory import (
     plot_sdf_size_summary,
 )
 
+from .prediction import (
+    DEFAULT_TARGET_IDS,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_BAO_LABELS,
+    DEFAULT_IC50_SUMMARY,
+    DEFAULT_IC50_OUTPUT_DIR,
+    DEFAULT_COXIB_SMARTS,
+    extract_ic50_by_target,
+    merge_ic50_summary,
+    merge_ic50_into_csv,
+    find_chembl_ids_by_smarts,
+)
+
 from .pipeline import (
     CheckpointManager,
     stage_path,
@@ -85,7 +98,7 @@ from .pipeline import (
     save_dataframe,
 )
 
-__version__ = "4.30" #Month.Day
+__version__ = "5.3" #Month.Day
 __author__ = "Dario M Lorente"
 
 __all__ = [
@@ -147,4 +160,15 @@ __all__ = [
     "cas_to_smiles",
     "filter_sdf_by_smiles",
     "plot_sdf_size_summary",
+    # Phase 3 prediction
+    "DEFAULT_TARGET_IDS",
+    "DEFAULT_CHUNK_SIZE",
+    "DEFAULT_BAO_LABELS",
+    "DEFAULT_IC50_SUMMARY",
+    "DEFAULT_IC50_OUTPUT_DIR",
+    "DEFAULT_COXIB_SMARTS",
+    "extract_ic50_by_target",
+    "merge_ic50_summary",
+    "merge_ic50_into_csv",
+    "find_chembl_ids_by_smarts",
 ]

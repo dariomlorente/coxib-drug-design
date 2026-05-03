@@ -1,0 +1,6 @@
+ChEMBL_ID;SMILES;IC50_COX1_median;IC50_COX2_median;SI_median;IC50_COX1_mean;IC50_COX2_mean;SI_mean
+CHEMBL4520818;NS(=O)(=O)c1ccc(N2C(=O)/C(=C\c3ccccc3Cl)N=C2c2ccc(Cl)cc2)cc1;;860.0;;;860.0;
+CHEMBL5271705;NS(=O)(=O)c1ccc(N2C(=O)/C(=C/c3ccc(OC(=O)c4ccccc4)cc3)N=C2c2ccccc2)cc1;;90.0;;;90.0;
+CHEMBL5276096;COc1cc(/C=C2\N=C(c3ccccc3)N(c3ccc(S(N)(=O)=O)cc3)C2=O)ccc1OC(=O)c1ccccc1;;87.0;;;87.0;
+CHEMBL5280920;O=C1/C(=C/c2ccc(Cl)cc2)N=C(c2ccccc2)N1c1ccc(-c2nc3ccccc3o2)cc1;;250.0;;;250.0;
+CHEMBL5286217;COc1cc(/C=C2\N=C(c3ccccc3)N(c3ccc(C(=O)O)cc3)C2=O)ccc1OC(=O)c1ccccc1;;92.0;;;92.0;

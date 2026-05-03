@@ -42,12 +42,15 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 | `py_utils/_utils.py` | Hardware resources + caching helpers (private) |
 | `py_utils/_smarts_catalog.py` | Brenk + PAINS structural alerts (private) |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
+| `protein_files/ChEMBL/` | ChEMBL activity exports (source CSVs, large, tracked locally) |
+| `protein_files/IC50s/` | Per-target IC50 CSVs derived from ChEMBL exports |
 | `00_purchased_reagents.ipynb` | Phase 0: Purchased reagents (CAS -> Enamine SDF subsets) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |
 | `03_activity_prediction.ipynb` | Phase 3: *In silico* activity prediction |
 | `py_utils/ultrafilter.py` | Phase 2 helper module (QED + bioavailability + price controls + plots) |
 | `py_utils/clustering.py` | Phase 3 helper module (ALMOS clustering + representatives + exports) |
+| `py_utils/prediction.py` | Phase 3 helper module (IC50 extraction + prediction utilities) |
 | `py_utils/inventory.py` | Phase 0 helper module (CAS -> SMILES -> SDF subset) |
 | `AI-workshops/Sessions/Session_7_Clustering/chemical_space_session.ipynb` | ALMOS workshop notebook (optional reference) |
 | `env.yml` | Conda environment specification |
@@ -150,6 +153,18 @@ Run-level outputs are written to `mol_files/7. Clustering/ALMOS/`:
 
 The metadata JSON stores command-line parameters, input SHA256, selected ALMOS outputs,
 and stdout/stderr log paths from the run folder under `mol_files/7. Clustering/ALMOS/.runs/`.
+
+## Phase 3 Inputs (IC50 extraction)
+
+The first cell in `03_activity_prediction.ipynb` scans the ChEMBL exports under
+`protein_files/ChEMBL/` and writes one CSV per target with `Standard Type == IC50`. It then
+builds `protein_files/IC50s/ChEMBL_IC50nSI.csv` after filtering to nM units, `=` relations,
+and BAO labels (`single protein format`, `cell-free format`, `cell-based format`). Outputs
+use the semicolon delimiter from the source files.
+
+The same cell can also merge IC50 summaries into Phase 2 and clustering CSVs (comma-delimited),
+deduplicating by SMILES with the cheapest price and writing outputs to
+`mol_files/8. From DrugBank/IC50s_<input>.csv`.
 
 ## Author
 
