@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -45,6 +45,29 @@ def _format_ignore_arg(ignore_cols: list[str]) -> str:
     return f'[{quoted}]'
 
 
+def _relative_repo_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return path.name
+
+
+def _sanitize_metadata_paths(payload: Any) -> Any:
+    """Recursively convert Path/absolute strings to repo-relative strings.
+
+    This keeps run metadata portable when notebooks are shared across machines.
+    """
+    if isinstance(payload, Path):
+        return _relative_repo_path(payload)
+    if isinstance(payload, list):
+        return [_sanitize_metadata_paths(item) for item in payload]
+    if isinstance(payload, dict):
+        return {str(key): _sanitize_metadata_paths(value) for key, value in payload.items()}
+    if isinstance(payload, str) and payload.startswith('/'):
+        return _relative_repo_path(Path(payload))
+    return payload
+
+
 def _sha256_file(path: Path, chunk_size: int = 1_048_576) -> str:
     digest = hashlib.sha256()
     with path.open('rb') as handle:
@@ -75,7 +98,7 @@ def _extract_rowcount_suffix(path: Path, prefix: str) -> int | None:
 
 def find_latest_clustering_input_csv(
     series_name: str,
-    clustering_dir: str | Path = 'mol_files/7. Clustering',
+    clustering_dir: str | Path = 'mol_files/8. Clustering',
 ) -> Path:
     """
     Find latest counted clustering-input CSV for one series.
@@ -111,7 +134,7 @@ def find_latest_clustering_input_csv(
 
 
 def load_phase2_clustering_input_paths(
-    clustering_dir: str | Path = 'mol_files/7. Clustering',
+    clustering_dir: str | Path = 'mol_files/8. Clustering',
 ) -> tuple[Path, Path]:
     """
     Load latest imidazolone/thiazolone clustering input paths.
@@ -590,8 +613,9 @@ def run_almos_cluster(
     )
 
     if print_report:
-        print(f"[run_almos_cluster] {' '.join(shlex.quote(part) for part in cmd)}")
-        print(f'[run_almos_cluster] cwd={run_path}')
+        input_rel = _relative_repo_path(input_csv)
+        print(f"[run_almos_cluster] --input {input_rel}")
+        print(f"[run_almos_cluster] cwd={_relative_repo_path(run_path)}")
 
     completed = subprocess.run(
         cmd,
@@ -949,7 +973,7 @@ def save_clustering_outputs(
     df_summary: pd.DataFrame,
     cluster_col: str,
     top_n: int,
-    output_dir: str | Path = 'mol_files/7. Clustering/ALMOS',
+    output_dir: str | Path = 'mol_files/8. Clustering/ALMOS',
     metadata: dict[str, Any] | None = None,
     print_report: bool = True,
 ) -> dict[str, Path]:
@@ -1017,7 +1041,7 @@ def save_clustering_outputs(
     df_shortlist.to_csv(paths['shortlist'], index=False)
     df_summary.to_csv(paths['summary'], index=False)
 
-    meta_payload = dict(metadata or {})
+    meta_payload = _sanitize_metadata_paths(dict(metadata or {}))
     meta_payload.update(
         {
             'series_name': series_name,
@@ -1025,8 +1049,12 @@ def save_clustering_outputs(
             'n_rows': n_rows,
             'n_clusters': n_clusters,
             'top_n': top_n,
-            'saved_at_utc': datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'outputs': {key: str(path) for key, path in paths.items() if key != 'metadata'},
+            'saved_at_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'outputs': {
+                key: _relative_repo_path(path)
+                for key, path in paths.items()
+                if key != 'metadata'
+            },
         }
     )
     paths['metadata'].write_text(
@@ -1035,12 +1063,8 @@ def save_clustering_outputs(
     )
 
     if print_report:
-        print(f"[save_clustering_outputs] {paths['clustered']}")
-        print(f"[save_clustering_outputs] {paths['representatives']}")
-        print(f"[save_clustering_outputs] {paths['samples']}")
-        print(f"[save_clustering_outputs] {paths['shortlist']}")
-        print(f"[save_clustering_outputs] {paths['summary']}")
-        print(f"[save_clustering_outputs] {paths['metadata']}")
+        for key in ['clustered', 'representatives', 'samples', 'shortlist', 'summary', 'metadata']:
+            print(f"[save_clustering_outputs] {_relative_repo_path(paths[key])}")
 
     return paths
 
@@ -1054,7 +1078,7 @@ def cluster_with_almos(
     smiles_col: str = 'SMILES',
     ignore_cols: list[str] | tuple[str, ...] | None = None,
     seed_clustered: int = 0,
-    output_dir: str | Path = 'mol_files/7. Clustering/ALMOS',
+    output_dir: str | Path = 'mol_files/8. Clustering/ALMOS',
     conda_env: str | None = None,
     python_executable: str | None = None,
     extra_args: list[str] | None = None,
@@ -1122,7 +1146,7 @@ def cluster_with_almos(
     )
 
     output_root = Path(output_dir).expanduser().resolve()
-    run_stamp = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
+    run_stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     run_dir = output_root / '.runs' / f"{_sanitize_token(series_name)}_{run_stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1254,7 +1278,7 @@ def cluster_inputs(
     n_clusters_imidazolones: int | None = None,
     n_clusters_thiazolones: int | None = None,
     top_n_per_cluster: int = 3,
-    output_dir: str | Path = 'mol_files/7. Clustering/ALMOS',
+    output_dir: str | Path = 'mol_files/8. Clustering/ALMOS',
     conda_env: str | None = None,
     print_report: bool = True,
 ) -> dict[str, dict[str, Path]]:
@@ -1320,8 +1344,8 @@ def run_phase3_clustering(
     n_clusters_imidazolones: int | None = None,
     n_clusters_thiazolones: int | None = None,
     top_n_per_cluster: int = 3,
-    clustering_input_dir: str | Path = 'mol_files/7. Clustering',
-    output_dir: str | Path = 'mol_files/7. Clustering/ALMOS',
+    clustering_input_dir: str | Path = 'mol_files/8. Clustering',
+    output_dir: str | Path = 'mol_files/8. Clustering/ALMOS',
     conda_env: str | None = None,
     print_report: bool = True,
 ) -> dict[str, dict[str, Path]]:
@@ -1353,8 +1377,8 @@ def run_phase3_clustering(
     imidazolones_path, thiazolones_path = load_phase2_clustering_input_paths(clustering_input_dir)
 
     if print_report:
-        print(f'[run_phase3_clustering] Imidazolones input: {imidazolones_path}')
-        print(f'[run_phase3_clustering] Thiazolones input:  {thiazolones_path}')
+        print(f'[run_phase3_clustering] Imidazolones input: {_relative_repo_path(imidazolones_path)}')
+        print(f'[run_phase3_clustering] Thiazolones input:  {_relative_repo_path(thiazolones_path)}')
 
     return cluster_inputs(
         imidazolones_input_csv=imidazolones_path,

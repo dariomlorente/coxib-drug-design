@@ -4,11 +4,14 @@ import multiprocessing as mp
 import os
 import re
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Lipinski, QED
+from .io import add_rdkit_properties
+from ._utils import _get_cache_key, _load_cache, _save_cache
 
 
 REQUIRED_BIOAVAILABILITY_COLS = [
@@ -25,10 +28,636 @@ REQUIRED_BIOAVAILABILITY_COLS = [
     "Rings",
 ]
 
+DESCRIPTOR_COLUMNS = [
+    "MW",
+    "HBD",
+    "HBA",
+    "RotB",
+    "HvyAtm",
+    "Rings",
+    "HetAtm",
+    "MR",
+    "CAtm",
+    "Atoms",
+    "tPSA",
+    "LogP",
+]
+
 
 def report_df_size(df: pd.DataFrame, label: str) -> None:
     """Print DataFrame size with a bracketed label."""
     print(f"[{label}] {len(df):,} rows")
+
+
+def load_chembl_ic50_summary(path: str | Path) -> pd.DataFrame:
+    """
+    Load the merged ChEMBL IC50 summary (semicolon-delimited).
+
+    Parameters
+    ----------
+    path
+        Path to ``ChEMBL_IC50nSI.csv``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Loaded summary table with stripped column names.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing IC50 summary file: {path}")
+
+    df = pd.read_csv(path, sep=";", low_memory=False)
+    df.columns = df.columns.str.strip()
+    return df
+
+
+def add_qsar_targets(
+    df: pd.DataFrame,
+    cox1_col: str = "IC50_COX1_median",
+    cox2_col: str = "IC50_COX2_median",
+) -> pd.DataFrame:
+    """
+    Add pIC50 targets and active label for COX2.
+
+    Parameters
+    ----------
+    df
+        Input DataFrame with IC50 columns.
+    cox1_col
+        Column name for COX1 median IC50 (nM).
+    cox2_col
+        Column name for COX2 median IC50 (nM).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input with pIC50 columns and active_COX2 label.
+    """
+    if cox1_col not in df.columns:
+        raise ValueError(f"Missing column '{cox1_col}'.")
+    if cox2_col not in df.columns:
+        raise ValueError(f"Missing column '{cox2_col}'.")
+
+    out = df.copy()
+    out[cox1_col] = pd.to_numeric(out[cox1_col], errors="coerce")
+    out[cox2_col] = pd.to_numeric(out[cox2_col], errors="coerce")
+
+    cox2_values = out[cox2_col]
+    cox1_values = out[cox1_col]
+
+    out["pIC50_COX2"] = np.nan
+    out["pIC50_COX1"] = np.nan
+
+    valid_cox2 = cox2_values > 0
+    valid_cox1 = cox1_values > 0
+    out.loc[valid_cox2, "pIC50_COX2"] = -np.log10(cox2_values.loc[valid_cox2] * 1e-9)
+    out.loc[valid_cox1, "pIC50_COX1"] = -np.log10(cox1_values.loc[valid_cox1] * 1e-9)
+
+    active = pd.Series(pd.NA, index=out.index, dtype="boolean")
+    mask = cox2_values.notna()
+    active.loc[mask] = cox2_values.loc[mask] <= 1000
+    out["active_COX2"] = active
+
+    return out
+
+
+def make_stratification_bins(
+    values: pd.Series,
+    n_bins: int = 10,
+    min_per_bin: int = 2,
+) -> pd.Series:
+    """
+    Create range-based bins for stratified splits on continuous targets.
+
+    Parameters
+    ----------
+    values
+        Series to bin (e.g. pIC50 values).
+    n_bins
+        Initial number of equal-width bins.
+    min_per_bin
+        Minimum number of samples required per bin.
+
+    Returns
+    -------
+    pd.Series
+        Categorical bin labels for stratification.
+    """
+    clean = values.dropna()
+    if clean.empty:
+        raise ValueError("No values available for stratification.")
+
+    max_bins = min(n_bins, int(clean.nunique()))
+    for bins in range(max_bins, 1, -1):
+        edges = np.linspace(clean.min(), clean.max(), bins + 1)
+        strata = pd.cut(values, bins=edges, include_lowest=True)
+        counts = strata.value_counts(dropna=True)
+        if not counts.empty and counts.min() >= min_per_bin:
+            return strata
+
+    raise ValueError("Unable to create stratification bins with adequate counts.")
+
+
+def compute_centroid_distances(
+    features: np.ndarray,
+    centroid: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute Euclidean distances to a centroid.
+
+    Parameters
+    ----------
+    features
+        2D array of (optionally scaled) feature values.
+    centroid
+        Optional centroid vector. When None, the centroid is computed as the
+        mean of ``features``.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        Distances and the centroid vector used.
+    """
+    features = np.asarray(features, dtype=float)
+    if features.ndim != 2:
+        raise ValueError("features must be a 2D array.")
+    if features.shape[0] == 0:
+        raise ValueError("features must contain at least one row.")
+
+    if centroid is None:
+        centroid_vec = features.mean(axis=0)
+    else:
+        centroid_vec = np.asarray(centroid, dtype=float)
+        if centroid_vec.ndim != 1:
+            raise ValueError("centroid must be a 1D array.")
+        if centroid_vec.shape[0] != features.shape[1]:
+            raise ValueError(
+                "centroid length does not match feature dimension: "
+                f"expected {features.shape[1]}, got {centroid_vec.shape[0]}"
+            )
+
+    distances = np.linalg.norm(features - centroid_vec, axis=1)
+    return distances, centroid_vec
+
+
+def pic50_to_ic50_nm(pic50_values: Iterable[float]) -> np.ndarray:
+    """
+    Convert pIC50 values (M) to IC50 in nM.
+
+    Parameters
+    ----------
+    pic50_values
+        Iterable of pIC50 values.
+
+    Returns
+    -------
+    np.ndarray
+        IC50 values in nM.
+    """
+    values = np.asarray(pic50_values, dtype=float)
+    return np.power(10.0, 9.0 - values)
+
+
+def compute_selectivity_index(
+    ic50_cox1_nm: Iterable[float],
+    ic50_cox2_nm: Iterable[float],
+) -> np.ndarray:
+    """
+    Compute selectivity index as IC50_COX1 / IC50_COX2.
+
+    Parameters
+    ----------
+    ic50_cox1_nm
+        Predicted COX1 IC50 values (nM).
+    ic50_cox2_nm
+        Predicted COX2 IC50 values (nM).
+
+    Returns
+    -------
+    np.ndarray
+        Selectivity index values.
+    """
+    cox1 = np.asarray(ic50_cox1_nm, dtype=float)
+    cox2 = np.asarray(ic50_cox2_nm, dtype=float)
+    return np.where(cox2 > 0, cox1 / cox2, np.nan)
+
+
+def compute_qsar_score(
+    pic50_cox2: Iterable[float],
+    pic50_cox1: Iterable[float],
+) -> np.ndarray:
+    """
+    Compute QSAR score as 2 * pIC50_COX2 - pIC50_COX1.
+
+    Parameters
+    ----------
+    pic50_cox2
+        Predicted pIC50 values for COX2.
+    pic50_cox1
+        Predicted pIC50 values for COX1.
+
+    Returns
+    -------
+    np.ndarray
+        QSAR scores.
+    """
+    co2 = np.asarray(pic50_cox2, dtype=float)
+    co1 = np.asarray(pic50_cox1, dtype=float)
+    return 2.0 * co2 - co1
+
+
+def _clean_smiles_column(
+    df: pd.DataFrame,
+    label: str,
+    smiles_candidates: list[str] | None = None,
+) -> pd.DataFrame:
+    candidates = smiles_candidates or ["Smiles", "SMILES", "Canonical SMILES", "canonical_smiles"]
+    smiles_col = next((col for col in candidates if col in df.columns), None)
+    if smiles_col is None:
+        raise ValueError(f"No SMILES column found. Checked: {candidates}")
+
+    out = df.copy()
+    start_rows = len(out)
+    out = out.dropna(subset=[smiles_col]).copy()
+    print(f"[{label}] Removed {start_rows - len(out):,} rows with NaN SMILES")
+
+    out[smiles_col] = out[smiles_col].astype(str).str.strip()
+    empty_mask = out[smiles_col].eq("")
+    print(f"[{label}] Removed {empty_mask.sum():,} empty/blank SMILES")
+    out = out.loc[~empty_mask].copy()
+
+    valid_mask = out[smiles_col].apply(lambda smi: Chem.MolFromSmiles(smi) is not None)
+    print(f"[{label}] Removed {len(out) - valid_mask.sum():,} invalid SMILES")
+    out = out.loc[valid_mask].copy()
+
+    if smiles_col != "SMILES":
+        out = out.rename(columns={smiles_col: "SMILES"})
+
+    return out
+
+
+def _prepare_qsar_training_data(
+    chembl_path: str | Path,
+) -> pd.DataFrame:
+    df_chembl = load_chembl_ic50_summary(chembl_path)
+    df_chembl = _clean_smiles_column(df_chembl, label="QSAR")
+    df_chembl = add_rdkit_properties(df_chembl)
+    df_chembl = add_qsar_targets(df_chembl)
+    df_chembl = df_chembl.dropna(subset=DESCRIPTOR_COLUMNS)
+    print(f"[QSAR] ChEMBL rows with descriptors: {len(df_chembl):,}")
+    return df_chembl
+
+
+def _train_qsar_models(
+    df_chembl: pd.DataFrame,
+    n_estimators: int = 500,
+    random_state: int = 42,
+) -> dict[str, object]:
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error, r2_score
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    df_cox2 = df_chembl[df_chembl["pIC50_COX2"].notna()].copy()
+    df_cox1 = df_chembl[df_chembl["pIC50_COX1"].notna()].copy()
+
+    X_cox2 = df_cox2[DESCRIPTOR_COLUMNS].to_numpy()
+    y_cox2 = df_cox2["pIC50_COX2"].to_numpy()
+    y_active = df_cox2["active_COX2"].astype(int).to_numpy()
+
+    strata = make_stratification_bins(df_cox2["pIC50_COX2"], n_bins=10)
+    (
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        y_active_train,
+        y_active_test,
+    ) = train_test_split(
+        X_cox2,
+        y_cox2,
+        y_active,
+        test_size=0.2,
+        random_state=random_state,
+        stratify=strata,
+    )
+
+    rf_reg = RandomForestRegressor(
+        n_estimators=n_estimators,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    rf_reg.fit(X_train, y_train)
+
+    rf_clf = RandomForestClassifier(
+        n_estimators=n_estimators,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    rf_clf.fit(X_train, y_active_train)
+
+    y_pred = rf_reg.predict(X_test)
+    y_class = rf_clf.predict(X_test)
+
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+    acc = accuracy_score(y_active_test, y_class)
+
+    print(f"[QSAR] COX2 RF regressor: MAE={mae:.3f}, RMSE={rmse:.3f}, R2={r2:.3f}")
+    print(f"[QSAR] COX2 RF classifier: Accuracy={acc:.3f}")
+
+    X_cox1 = df_cox1[DESCRIPTOR_COLUMNS].to_numpy()
+    y_cox1 = df_cox1["pIC50_COX1"].to_numpy()
+
+    rf_cox1 = RandomForestRegressor(
+        n_estimators=n_estimators,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    rf_cox1.fit(X_cox1, y_cox1)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    train_distances, centroid = compute_centroid_distances(X_train_scaled)
+    ad_threshold = np.quantile(train_distances, 0.95)
+    print(f"[QSAR] AD cutoff (95th percentile): {ad_threshold:.3f}")
+
+    return {
+        "rf_reg_cox2": rf_reg,
+        "rf_clf_cox2": rf_clf,
+        "rf_reg_cox1": rf_cox1,
+        "scaler": scaler,
+        "ad_threshold": ad_threshold,
+        "centroid": centroid,
+    }
+
+
+def _load_qsar_model_cache(cache_file: Path) -> dict[str, object] | None:
+    cache = _load_cache(cache_file)
+    if not cache:
+        return None
+
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    from sklearn.preprocessing import StandardScaler
+
+    try:
+        if cache.get("version") != 1:
+            return None
+        if cache.get("type") != "qsar_models":
+            return None
+
+        df_cache = cache.get("models")
+        if df_cache is None:
+            return None
+
+        df_cox2 = pd.DataFrame(df_cache.get("cox2", []))
+        df_cox1 = pd.DataFrame(df_cache.get("cox1", []))
+        if df_cox2.empty or df_cox1.empty:
+            return None
+
+        rf_reg = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+        rf_reg.fit(df_cox2[DESCRIPTOR_COLUMNS].to_numpy(), df_cox2["pIC50_COX2"].to_numpy())
+
+        rf_clf = RandomForestClassifier(n_estimators=500, random_state=42, n_jobs=-1)
+        rf_clf.fit(
+            df_cox2[DESCRIPTOR_COLUMNS].to_numpy(),
+            df_cox2["active_COX2"].astype(int).to_numpy(),
+        )
+
+        rf_cox1 = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+        rf_cox1.fit(df_cox1[DESCRIPTOR_COLUMNS].to_numpy(), df_cox1["pIC50_COX1"].to_numpy())
+
+        scaler = StandardScaler()
+        X_train = df_cox2[DESCRIPTOR_COLUMNS].to_numpy()
+        X_train_scaled = scaler.fit_transform(X_train)
+        train_distances, centroid = compute_centroid_distances(X_train_scaled)
+        ad_threshold = np.quantile(train_distances, 0.95)
+
+        return {
+            "rf_reg_cox2": rf_reg,
+            "rf_clf_cox2": rf_clf,
+            "rf_reg_cox1": rf_cox1,
+            "scaler": scaler,
+            "ad_threshold": float(ad_threshold),
+            "centroid": centroid,
+        }
+    except Exception:
+        return None
+
+
+def _save_qsar_model_cache(cache_file: Path, df_chembl: pd.DataFrame) -> None:
+    df_cox2 = df_chembl[df_chembl["pIC50_COX2"].notna()].copy()
+    df_cox1 = df_chembl[df_chembl["pIC50_COX1"].notna()].copy()
+
+    cache = {
+        "version": 1,
+        "type": "qsar_models",
+        "models": {
+            "cox2": df_cox2[[*DESCRIPTOR_COLUMNS, "pIC50_COX2", "active_COX2"]].to_dict("records"),
+            "cox1": df_cox1[[*DESCRIPTOR_COLUMNS, "pIC50_COX1"]].to_dict("records"),
+        },
+    }
+    _save_cache(cache_file, cache)
+
+
+def _predict_qsar_for_series(
+    df: pd.DataFrame,
+    label: str,
+    models: dict[str, object],
+) -> pd.DataFrame:
+    out = _clean_smiles_column(df, label=f"QSAR {label}")
+    out = add_rdkit_properties(out)
+    out = out.dropna(subset=DESCRIPTOR_COLUMNS)
+    print(f"[QSAR {label}] Rows with descriptors: {len(out):,}")
+
+    if out.empty:
+        return out
+
+    X = out[DESCRIPTOR_COLUMNS].to_numpy()
+    rf_reg = models["rf_reg_cox2"]
+    rf_cox1 = models["rf_reg_cox1"]
+    scaler = models["scaler"]
+    ad_threshold = float(models["ad_threshold"])
+    centroid = models.get("centroid")
+
+    pic50_cox2_pred = rf_reg.predict(X)
+    pic50_cox1_pred = rf_cox1.predict(X)
+
+    ic50_cox2_pred = pic50_to_ic50_nm(pic50_cox2_pred)
+    ic50_cox1_pred = pic50_to_ic50_nm(pic50_cox1_pred)
+    si_pred = compute_selectivity_index(ic50_cox1_pred, ic50_cox2_pred)
+    qsar_score = compute_qsar_score(pic50_cox2_pred, pic50_cox1_pred)
+
+    X_scaled = scaler.transform(X)
+    if centroid is None:
+        rep_distances, _ = compute_centroid_distances(X_scaled)
+    else:
+        rep_distances, _ = compute_centroid_distances(X_scaled, centroid=np.asarray(centroid))
+
+    out["AD_Distance"] = rep_distances
+    out["In_AD"] = out["AD_Distance"] <= ad_threshold
+    out["pIC50_COX2_pred"] = pic50_cox2_pred
+    out["pIC50_COX1_pred"] = pic50_cox1_pred
+    out["IC50_COX2_pred_nM"] = ic50_cox2_pred
+    out["IC50_COX1_pred_nM"] = ic50_cox1_pred
+    out["SI_pred"] = si_pred
+    out["QSAR_score"] = qsar_score
+
+    return out
+
+
+def _select_top_by_qsar_score(
+    df: pd.DataFrame,
+    acceptance_rate: float,
+    minimum: int,
+    score_col: str = "QSAR_score",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    total = len(df)
+    if total == 0:
+        return df.copy(), df.copy()
+
+    keep_pct = int(total * acceptance_rate)
+    if acceptance_rate > 0 and keep_pct == 0:
+        keep_pct = 1
+
+    keep_n = min(total, max(keep_pct, minimum))
+    ordered = df.sort_values(score_col, ascending=False, kind="stable").reset_index(drop=True)
+    accepted = ordered.head(keep_n).copy()
+    rejected = ordered.tail(total - keep_n).copy()
+    return accepted, rejected
+
+
+def run_qsar_winnow(
+    df_imidazolones_druglike: pd.DataFrame,
+    df_thiazolones_druglike: pd.DataFrame,
+    chembl_path: str | Path = "protein_files/IC50s/ChEMBL_IC50nSI.csv",
+    acceptance_rate: float = 0.01,
+    minimum: int = 1000,
+    output_dir: str | Path = "mol_files/7. QSAR",
+    use_cache: bool = True,
+    cache_file: str | Path | None = None,
+    print_report: bool = True,
+) -> tuple[dict[str, pd.DataFrame], dict[str, Path]]:
+    """
+    Run ML-QSAR winnowing for imidazolones and thiazolones.
+
+    Parameters
+    ----------
+    df_imidazolones_druglike
+        Imidazolones after bioavailability filtering.
+    df_thiazolones_druglike
+        Thiazolones after bioavailability filtering.
+    chembl_path
+        Path to ChEMBL IC50 summary file.
+    acceptance_rate
+        Fraction for top percentile selection (e.g. 0.01 for top 1%).
+    minimum
+        Minimum count of top compounds to keep.
+    output_dir
+        Output directory for QSAR results.
+    use_cache
+        Use a persistent cache to avoid re-training on every run.
+    cache_file
+        Optional cache file path. When None, defaults to
+        ``{output_dir}/.cache/qsar_models.json.gz``.
+    print_report
+        Print progress and output paths.
+
+    Returns
+    -------
+    tuple[dict[str, pd.DataFrame], dict[str, Path]]
+        Accepted/rejected DataFrames and output paths.
+    """
+    if acceptance_rate < 0 or acceptance_rate > 1:
+        raise ValueError("acceptance_rate must be between 0 and 1.")
+    if minimum <= 0:
+        raise ValueError("minimum must be greater than 0.")
+
+    output_dir = Path(output_dir)
+
+    cache_path = None
+    if use_cache:
+        if cache_file is None:
+            cache_path = output_dir / ".cache" / "qsar_models.json.gz"
+        else:
+            cache_path = Path(cache_file)
+
+    models = None
+    if cache_path is not None:
+        models = _load_qsar_model_cache(cache_path)
+        if models is not None and print_report:
+            try:
+                cache_display = cache_path.resolve().relative_to(Path.cwd())
+            except Exception:
+                cache_display = Path(cache_path.name)
+            print(f"[QSAR] Loaded model cache: {cache_display}")
+
+    if models is None:
+        df_chembl = _prepare_qsar_training_data(chembl_path)
+        models = _train_qsar_models(df_chembl)
+        if cache_path is not None:
+            _save_qsar_model_cache(cache_path, df_chembl)
+            if print_report:
+                try:
+                    cache_display = cache_path.resolve().relative_to(Path.cwd())
+                except Exception:
+                    cache_display = Path(cache_path.name)
+                print(f"[QSAR] Saved model cache: {cache_display}")
+
+    df_imi_pred = _predict_qsar_for_series(df_imidazolones_druglike, "Imidazolones", models)
+    df_thi_pred = _predict_qsar_for_series(df_thiazolones_druglike, "Thiazolones", models)
+
+    df_imi_acc, df_imi_rej = _select_top_by_qsar_score(df_imi_pred, acceptance_rate, minimum)
+    df_thi_acc, df_thi_rej = _select_top_by_qsar_score(df_thi_pred, acceptance_rate, minimum)
+
+    if print_report:
+        keep_imi = len(df_imi_acc)
+        keep_thi = len(df_thi_acc)
+        pct_imi = max(1, int(len(df_imi_pred) * acceptance_rate)) if len(df_imi_pred) else 0
+        pct_thi = max(1, int(len(df_thi_pred) * acceptance_rate)) if len(df_thi_pred) else 0
+        print(
+            f"[QSAR] Selection counts (max of {acceptance_rate:.2%} vs {minimum}): "
+            f"Imidazolones keep_n={keep_imi} ({acceptance_rate:.2%}={pct_imi}), "
+            f"Thiazolones keep_n={keep_thi} ({acceptance_rate:.2%}={pct_thi})"
+        )
+        print(f"[QSAR] Imidazolones: {len(df_imi_acc):,} accepted, {len(df_imi_rej):,} rejected")
+        print(f"[QSAR] Thiazolones: {len(df_thi_acc):,} accepted, {len(df_thi_rej):,} rejected")
+
+    rejected_dir = output_dir / ".rejected"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = {
+        "imidazolones_accepted": output_dir
+        / f"Imidazolones_qsar_{len(df_imi_acc)}cmpds.csv",
+        "thiazolones_accepted": output_dir
+        / f"Thiazolones_qsar_{len(df_thi_acc)}cmpds.csv",
+        "imidazolones_rejected": rejected_dir
+        / f"Imidazolones_rejected_qsar_{len(df_imi_rej)}cmpds.csv",
+        "thiazolones_rejected": rejected_dir
+        / f"Thiazolones_rejected_qsar_{len(df_thi_rej)}cmpds.csv",
+    }
+
+    df_imi_acc.to_csv(paths["imidazolones_accepted"], index=False)
+    df_thi_acc.to_csv(paths["thiazolones_accepted"], index=False)
+    df_imi_rej.to_csv(paths["imidazolones_rejected"], index=False)
+    df_thi_rej.to_csv(paths["thiazolones_rejected"], index=False)
+
+    if print_report:
+        print(f"[Save] {paths['imidazolones_accepted']}")
+        print(f"[Save] {paths['thiazolones_accepted']}")
+        print(f"[Save] {paths['imidazolones_rejected']}")
+        print(f"[Save] {paths['thiazolones_rejected']}")
+
+    outputs = {
+        "imidazolones_accepted": df_imi_acc,
+        "thiazolones_accepted": df_thi_acc,
+        "imidazolones_rejected": df_imi_rej,
+        "thiazolones_rejected": df_thi_rej,
+    }
+
+    return outputs, paths
 
 
 def _extract_counted_suffix(path: Path, prefix: str) -> int | None:
@@ -702,8 +1331,8 @@ def save_price_control_outputs(
     df_thiazolones_input: pd.DataFrame,
     df_imidazolones_rejected_pricectrl: pd.DataFrame,
     df_thiazolones_rejected_pricectrl: pd.DataFrame,
-    input_dir: str | Path = "mol_files/7. Clustering/.inputs",
-    rejected_dir: str | Path = "mol_files/7. Clustering/.rejected",
+    input_dir: str | Path = "mol_files/8. Clustering/.inputs",
+    rejected_dir: str | Path = "mol_files/8. Clustering/.rejected",
     print_report: bool = True,
 ) -> dict[str, Path]:
     """
@@ -772,14 +1401,14 @@ def run_clustering_input_export(
     max_sample_thi: int = 30000,
 ) -> dict[str, Path]:
     """
-    Run full clustering input export pipeline for both series.
+    Run clustering input export pipeline for both series.
 
     Parameters
     ----------
     df_imidazolones_druglike
-        Accepted imidazolones from bioavailability filter.
+        Accepted imidazolones from the prior stage.
     df_thiazolones_druglike
-        Accepted thiazolones from bioavailability filter.
+        Accepted thiazolones from the prior stage.
     max_price_imi
         Max price for imidazolones.
     max_price_thi
@@ -816,8 +1445,8 @@ def run_clustering_input_export(
         df_thiazolones_input=df_thi_in,
         df_imidazolones_rejected_pricectrl=df_imi_rej,
         df_thiazolones_rejected_pricectrl=df_thi_rej,
-        input_dir="mol_files/7. Clustering/.inputs",
-        rejected_dir="mol_files/7. Clustering/.rejected",
+        input_dir="mol_files/8. Clustering/.inputs",
+        rejected_dir="mol_files/8. Clustering/.rejected",
     )
 
 

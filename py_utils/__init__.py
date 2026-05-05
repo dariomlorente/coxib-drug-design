@@ -7,7 +7,7 @@ from __future__ import annotations
 #   - filters: filter_Veber, filter_BrenkPAINS
 #   - enamine_api: EnamineClient, add_enamine_prices
 #   - pipeline: CheckpointManager, load_or_run, load_or_filter, paths
-#   - ultrafilter: Phase 2 QED + prioritization helpers
+#   - winnowing: Phase 2 QED + prioritization + QSAR helpers
 #   - clustering: Phase 3 ALMOS clustering helpers
 #   - inventory: Phase 0 inventory helpers
 
@@ -34,7 +34,7 @@ from .enamine_api import (
     add_enamine_prices,
 )
 
-from .ultrafilter import (
+from .winnowing import (
     find_latest_stage_csv,
     load_generated_product_sets,
     ensure_required_bioavailability_columns,
@@ -46,6 +46,15 @@ from .ultrafilter import (
     save_price_control_outputs,
     plot_qed_histograms,
     run_clustering_input_export,
+    DESCRIPTOR_COLUMNS,
+    load_chembl_ic50_summary,
+    add_qsar_targets,
+    make_stratification_bins,
+    compute_centroid_distances,
+    pic50_to_ic50_nm,
+    compute_selectivity_index,
+    compute_qsar_score,
+    run_qsar_winnow,
 )
 
 from .clustering import (
@@ -87,6 +96,7 @@ from .prediction import (
     find_chembl_ids_by_smarts,
 )
 
+
 from .pipeline import (
     CheckpointManager,
     stage_path,
@@ -98,8 +108,8 @@ from .pipeline import (
     save_dataframe,
 )
 
-__version__ = "5.3" #Month.Day
-__author__ = "Dario M Lorente"
+__version__ = "5.5" #Month.Day
+__author__ = "Darío M. Lorente"
 
 __all__ = [
     # Reactions
@@ -138,6 +148,16 @@ __all__ = [
     "save_price_control_outputs",
     "plot_qed_histograms",
     "run_clustering_input_export",
+    # QSAR helpers
+    "DESCRIPTOR_COLUMNS",
+    "load_chembl_ic50_summary",
+    "add_qsar_targets",
+    "make_stratification_bins",
+    "compute_centroid_distances",
+    "pic50_to_ic50_nm",
+    "compute_selectivity_index",
+    "compute_qsar_score",
+    "run_qsar_winnow",
     # Phase 3
     "DEFAULT_IGNORE_COLS",
     "find_latest_clustering_input_csv",
