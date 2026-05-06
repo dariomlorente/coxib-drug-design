@@ -4,37 +4,43 @@ Final Degree Project (*Trabajo de Fin de Grado*), Universidad de Zaragoza, 2025�
 
 Design and computational evaluation of a focused combinatorial library of COX-2 selective inhibitors (coxibs). The *in silico* component covers virtual compound generation via multi-step heterocyclic synthesis, drug-likeness filtering, and purchasability assessment using commercially available building blocks.
 
-## Background
+## Background:
 
-Cyclooxygenase-2 (COX-2) selective inhibitors are a class of non-steroidal anti-inflammatory drugs (NSAIDs) with reduced gastrointestinal side effects compared to non-selective NSAIDs. This work focuses on the computational design of novel imidazolone-, and thiazolone-based scaffolds derived from three commercial lists of building blocks.
+Cyclooxygenase-2 (COX-2) selective inhibitors are a class of non-steroidal anti-inflammatory drugs (NSAIDs) with reduced gastrointestinal side effects compared to non-selective NSAIDs. This work focuses on the computational design of novel imidazolone- and thiazolone-based scaffolds derived from three commercial lists of building blocks.
 
-## Requirements
+## Requirements:
 
 - Python 3.10+
 - Conda (recommended for environment management)
-- ALMOS CLI (`almos-kit`) available in the execution environment for the ALMOS clustering stage
+- ALMOS CLI (`almos-kit`) available for the ALMOS clustering stage
 - Enamine Store API credentials (optional — required for real-time compound pricing)
 
-## Installation
+## Installation:
 
 ```bash
-conda env create -f env.yml
+conda env create -f synthesis.yml
 conda activate coxibs
 ```
 
-## Computational Pipeline
+Additional environments (for later phases):
+```bash
+conda env create -f clustering.yml
+conda env create -f docking.yml
+```
+
+## Computational Pipeline:
 
 Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the Enamine commercial catalogue and filtered by price and bioavailability (Veber criteria). A hard global molecular-price cutoff is also enforced (`PriceMol <= MAX_PRICE_MOL`, currently `200.00`) in Veber filters and reaction pairing. Filtered sets are then combined through three encoded reaction pathways. The resulting products (imidazolones and thiazolones) are filtered for structural alerts (Brenk + PAINS) before export:
 
 | Step | Reaction | Inputs | Output |
-|------|----------|--------|--------|
+|------|----------|---------|--------|
 | 1 | Erlenmeyer–Plöchl condensation | Aldehydes + Carboxylic acids | Oxazolones |
 | 2 | Aminolysis (GFPc variant) | Oxazolones + Amines | Imidazolones |
 | 3 | Sulphur exchange | Oxazolones | Thiazolones |
 
-Reactions are implemented as RDKit SMARTS templates. The resulting library is re-assessed for drug-likeness before export. The `filter_BrenkPAINS` function removes compounds with structural alerts.
+Reactions are implemented as RDKit SMARTS templates. The resulting library is reassessed for drug-likeness before export. The `filter_BrenkPAINS` function removes compounds with structural alerts.
 
-## Repository Structure
+## Repository Structure:
 
 | Path | Description |
 |------|-------------|
@@ -42,20 +48,21 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 | `py_utils/_utils.py` | Hardware resources + caching helpers (private) |
 | `py_utils/_smarts_catalog.py` | Brenk + PAINS structural alerts (private) |
 | `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
-| `protein_files/ChEMBL/` | ChEMBL activity exports (source CSVs, large, tracked locally) |
-| `protein_files/IC50s/` | Per-target IC50 CSVs derived from ChEMBL exports |
-| `00_purchased_reagents.ipynb` | Phase 0: Purchased reagents (CAS -> Enamine SDF subsets) |
+| `protein_files/` | PDB structures, ChEMBL data, docking outputs |
+| `00_purchased_reagents.ipynb` | Phase 0: Purchased reagents (CAS → Enamine SDF subsets) |
 | `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
 | `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |
-| `03_activity_prediction.ipynb` | Phase 3: Molecular dynamics (MD) workflows |
-| `py_utils/winnowing.py` | Phase 2 helper module (QED + bioavailability + price controls + QSAR) |
-| `py_utils/clustering.py` | Phase 3 helper module (ALMOS clustering + representatives + exports) |
-| `py_utils/prediction.py` | Phase 3 helper module (IC50 extraction + prediction utilities) |
-| `py_utils/inventory.py` | Phase 0 helper module (CAS -> SMILES -> SDF subset) |
-| `AI-workshops/Sessions/Session_7_Clustering/chemical_space_session.ipynb` | ALMOS workshop notebook (optional reference) |
-| `env.yml` | Conda environment specification |
+| `03_docking_validation.ipynb` | Phase 3: Docking validation |
+| `py_utils/winnowing.py` | Phase 2 helper (QED + bioavailability + QSAR) |
+| `py_utils/clustering.py` | Phase 2 helper (ALMOS clustering + representatives + exports) |
+| `py_utils/docking.py` | Phase 3 helper (docking + pose scoring + ranking) |
+| `py_utils/inventory.py` | Phase 0 helper (CAS → SMILES → SDF subset) |
+| `scripts/visualize_pose.py` | Pose visualization script (PyMOL-based, HPC-safe) |
+| `synthesis.yml` | Conda environment for Phase 1 (RDKit, pandas) |
+| `clustering.yml` | Conda environment for Phase 2 (ALMOS, scikit-learn) |
+| `docking.yml` | Conda environment for Phase 3 (PyMOL, Vina, RDKit) |
 
-## File Naming Convention
+## File Naming Convention:
 
 All output files include row counts for clarity and easy identification:
 
@@ -77,9 +84,9 @@ mol_files/4. Imidazolones/
   .rejected/
 ```
 
-## Checkpoint System
+## Checkpoint System:
 
-The pipeline now uses a robust checkpoint system for crash recovery:
+The pipeline uses a robust checkpoint system for crash recovery:
 
 - **Reaction outputs**: `{Stage}_raw_{N}cmpds.csv` (row count in filename)
 - **Checkpoints**: `.cache/{Stage}_checkpoint.json` (metadata in `.cache/`)
@@ -96,14 +103,9 @@ If the kernel crashes, re-running the notebook will:
 3. Resume from the last completed chunk
 4. Continue until completion
 
-## Phase 2 Outputs (Hit Prioritization)
+## Phase 2 Outputs (Hit Prioritization):
 
-Notebook `02_hit_prioritization.ipynb` loads Phase 1 products (`*_brenkpains_*cmpds.csv`),
-adds QED, applies a composite bioavailability filter (Lipinski, Ghose, Egan, Muegge,
-Veber) with a **4/5 pass threshold**, exports phase-2 accepted/rejected sets under
-`mol_files/6. QED/`, runs an ML-QSAR winnow stage (COX2/COX1 Random Forest models +
-applicability domain), exports QSAR accepted/rejected sets under `mol_files/7. QSAR/`,
-and then runs ALMOS clustering on the QSAR-accepted sets.
+Notebook `02_hit_prioritization.ipynb` loads Phase 1 products (`*_brenkpains_*cmpds.csv`), adds QED, applies a composite bioavailability filter (Lipinski, Ghose, Egan, Muegge, Veber) with a **4/5 pass threshold**, exports phase-2 accepted/rejected sets under `mol_files/6. QED/`, runs an ML-QSAR winnow stage (COX2/COX1 Random Forest models + applicability domain), exports QSAR accepted/rejected sets under `mol_files/7. QSAR/`, and then runs ALMOS clustering on the QSAR-accepted sets.
 
 Output paths:
 
@@ -121,19 +123,15 @@ QSAR outputs:
 - Rejected imidazolones: `mol_files/7. QSAR/.rejected/Imidazolones_rejected_qsar_{N}cmpds.csv`
 - Rejected thiazolones: `mol_files/7. QSAR/.rejected/Thiazolones_rejected_qsar_{N}cmpds.csv`
 
-## ALMOS Clustering Outputs
+## ALMOS Clustering Outputs:
 
-ALMOS clustering consumes the Phase 2 clustering-input files and runs independently for
-imidazolones and thiazolones. The canonical execution entrypoint is now the ALMOS section
-inside `02_hit_prioritization.ipynb`, backed by `py_utils/clustering.py` (same pipeline stage).
+ALMOS clustering consumes the Phase 2 clustering-input files and runs independently for imidazolones and thiazolones. The canonical execution entrypoint is the ALMOS section inside `02_hit_prioritization.ipynb`, backed by `py_utils/clustering.py` (same pipeline stage).
 
-Implementation note: ALMOS requires a unique `--name` column. If `ID` contains duplicates,
-the helper module auto-generates a temporary unique name column (`ALMOS_ID`) for the ALMOS
-run and maps cluster labels back to the original rows.
+Implementation note: ALMOS requires a unique `--name` column. If `ID` contains duplicates, the helper module auto-generates a temporary unique name column (`ALMOS_ID`) for the ALMOS run and maps cluster labels back to the original rows.
 
 Run-level outputs are written to `mol_files/8. Clustering/ALMOS/`:
 
-- Representatives (one per cluster, simplified for discussion):
+- Representatives (one per cluster):
   - `mol_files/8. Clustering/Imidazolones_{K}_samples.csv`
   - `mol_files/8. Clustering/Thiazolones_{K}_samples.csv`
 - Full clustered imidazolones: `mol_files/8. Clustering/ALMOS/Imidazolones_clusters_k{K}_{N}cmpds.csv`
@@ -151,14 +149,11 @@ Run-level outputs are written to `mol_files/8. Clustering/ALMOS/`:
   - `mol_files/8. Clustering/ALMOS/Imidazolones_cluster_run_k{K}_{N}cmpds.json`
   - `mol_files/8. Clustering/ALMOS/Thiazolones_cluster_run_k{K}_{N}cmpds.json`
 
-The metadata JSON stores command-line parameters, input SHA256, selected ALMOS outputs,
-and stdout/stderr log paths from the run folder under `mol_files/8. Clustering/ALMOS/.runs/`.
+The metadata JSON stores command-line parameters, input SHA256, selected ALMOS outputs, and stdout/stderr log paths from the run folder under `mol_files/8. Clustering/ALMOS/.runs/`.
 
-## Phase 3 (Molecular Dynamics)
+## Phase 3 (Docking Validation):
 
-Notebook `03_activity_prediction.ipynb` is reserved for molecular dynamics (MD)
-simulations and binding analysis of top cluster representatives. QSAR modelling
-and IC₅₀ prediction are handled entirely within `02_hit_prioritization.ipynb`.
+Notebook `03_docking_validation.ipynb` validates QSAR-selected cluster representatives via AutoDock Vina docking. It handles ligand preparation, docking execution, pose validation, geometric scoring, and composite ranking. QSAR modelling and IC₅₀ prediction are handled entirely within `02_hit_prioritization.ipynb`.
 
 Representative compounds are loaded from:
 - `mol_files/8. Clustering/Imidazolones_{K}_samples.csv`
@@ -167,7 +162,15 @@ Representative compounds are loaded from:
 QSAR predictions produced by Phase 2 are available at:
 - `protein_files/Machine Learning/qsar_predictions.csv`
 
-## Author
+### Visualization:
+
+Pose visualization uses `scripts/visualize_pose.py`, a standalone PyMOL-based script that:
+- Converts ligand PDBQT → PDB via Open Babel
+- Renders receptor (cartoon, light blue) and ligand (sticks, magenta)
+- Outputs 1200×900 PNG at 300 DPI
+- Runs headless (no GUI), suitable for HPC environments
+
+## Author:
 
 Darío M. Lorente — University of Zaragoza  
 [840629@unizar.es](mailto:840629@unizar.es)  

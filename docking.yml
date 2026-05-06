@@ -12,10 +12,10 @@ dependencies:
   - vina=1.2.5
   - gemmi
   - openbabel
+  - pymol-open-source
   #- mdanalysis>=2.6 #?
   - jupyter
   - jupyterlab
   - ipykernel
-  - pip
   - pip:
       - meeko
