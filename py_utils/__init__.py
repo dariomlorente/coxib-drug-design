@@ -96,6 +96,24 @@ from .prediction import (
     find_chembl_ids_by_smarts,
 )
 
+from .docking import (
+    init_hpc_dirs,
+    prepare_ligands,
+    prepare_receptor,
+    get_binding_site_center,
+    write_mapping_csv,
+    generate_docking_slurm,
+    parse_docking_logs,
+    compute_docking_analysis,
+    generate_rescore_slurm,
+    parse_mmgbsa_results,
+    compute_composite_score,
+    select_md_candidates,
+    generate_md_slurm,
+    save_docking_scores,
+    save_mmgbsa_scores,
+    save_md_candidates,
+)
 
 from .pipeline import (
     CheckpointManager,
@@ -191,4 +209,21 @@ __all__ = [
     "merge_ic50_summary",
     "merge_ic50_into_csv",
     "find_chembl_ids_by_smarts",
+    # Phase 3 docking & MD
+    "init_hpc_dirs",
+    "prepare_ligands",
+    "prepare_receptor",
+    "get_binding_site_center",
+    "write_mapping_csv",
+    "generate_docking_slurm",
+    "parse_docking_logs",
+    "compute_docking_analysis",
+    "generate_rescore_slurm",
+    "parse_mmgbsa_results",
+    "compute_composite_score",
+    "select_md_candidates",
+    "generate_md_slurm",
+    "save_docking_scores",
+    "save_mmgbsa_scores",
+    "save_md_candidates",
 ]
