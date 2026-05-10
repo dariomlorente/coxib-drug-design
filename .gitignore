@@ -1,87 +1,45 @@
 # =========================
-# OS / SYSTEM FILES
+# 1. OS / SYSTEM FILES
 # =========================
 .DS_Store
 Thumbs.db
 
 # =========================
-# PYTHON
+# 2. PYTHON / JUPYTER
 # =========================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-
-# =========================
-# JUPYTER
-# =========================
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
 
 # =========================
-# TEMP / CACHE FILES
-# =========================
-*.tmp
-*.temp
-*.log
-.cache/
-*.json.gz
-
-# =========================
-# VIRTUAL ENVIRONMENTS
+# 3. VIRTUAL ENVIRONMENTS & SECRETS
 # =========================
 .env
 .venv
 venv/
-
-# =========================
-# GLOBAL DATA RULES
-# =========================
-# Ignore all CSV files by default
-*.csv
-
-# =========================
-# SDF FILES (ENAMINE)
-# =========================
-# Ignore large Enamine stock files
-mol_files/1. Enamine SDFs/EnamineBBStock_*.sdf
-# Allow small / curated datasets
-!mol_files/1. Enamine SDFs/TESTER_*.sdf
-!mol_files/1. Enamine SDFs/PurchasedByEsteban_*.sdf
-
-# =========================
-# GENERATED DATA (PIPELINE OUTPUTS)
-# =========================
-# Ignore everything inside these folders
-mol_files/0. Esteban BBs/*
-mol_files/2. Building Blocks/*
-mol_files/3. Oxazolones/*
-mol_files/4. Imidazolones/*
-mol_files/5. Thiazolones/*
-mol_files/6. QED/*
-mol_files/7. QSAR/*
-mol_files/8. Clustering/*
-
-# =========================
-# SELECTIVE DATA TRACKING
-# =========================
-# QSAR datasets (important results)
-!mol_files/7. QSAR/*.csv
-# Clustering representative samples
-!mol_files/8. Clustering/*.csv
-# Experimental IC50 dataset
-!protein_files/IC50s/ChEMBL_IC50nSI.csv
-
-# =========================
-# NOTES / LOCAL FILES
-# =========================
 *.md
-*.xlsx
-# Allow main documentation
-!README.md
 
 # =========================
-# HPC / RUNTIME OUTPUTS
+# 4. LARGE / PRIVATE DATA
 # =========================
-hpc_jobs/
+.raw_data_curation/
+
+# =========================
+# 5. GENERATED PIPELINE INTERMEDIATES
+# =========================
+01_library_mols_data/.interim/
+02_selected_mols_data/.interim/
+03_docking_pdbqts_data/.interim/
+
+# =========================
+# SELECTIVE TRACKING EXCEPTIONS
+# =========================
+!README.md
+!01_library_mols_data/README.md
+!02_selected_mols_data/README.md
+!03_docking_pdbqts_data/README.md
+!figures/README.md

@@ -1,3 +1,5 @@
+![@TheAlegreGroup](figures/.affiliation.png)
+
 # Bachelor's Thesis — Coxib Drug Design
 
 Final Degree Project (*Trabajo de Fin de Grado*), Universidad de Zaragoza, 2025–26.
@@ -18,14 +20,14 @@ Cyclooxygenase-2 (COX-2) selective inhibitors are a class of non-steroidal anti-
 ## Installation:
 
 ```bash
-conda env create -f synthesis.yml
+conda env create -f envs/synthesis.yml
 conda activate coxibs
 ```
 
 Additional environments (for later phases):
 ```bash
-conda env create -f clustering.yml
-conda env create -f docking.yml
+conda env create -f envs/clustering.yml
+conda env create -f envs/docking.yml
 ```
 
 ## Computational Pipeline:
@@ -44,23 +46,20 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 
 | Path | Description |
 |------|-------------|
-| `py_utils/` | Python package: reactions, filters, I/O, pricing, pipeline |
-| `py_utils/_utils.py` | Hardware resources + caching helpers (private) |
-| `py_utils/_smarts_catalog.py` | Brenk + PAINS structural alerts (private) |
-| `mol_files/` | Input SDFs (tracked) and generated outputs (gitignored) |
-| `protein_files/` | PDB structures, ChEMBL data, docking outputs |
-| `00_purchased_reagents.ipynb` | Phase 0: Purchased reagents (CAS → Enamine SDF subsets) |
-| `01_library_generation.ipynb` | Phase 1: Combinatorial library generation |
-| `02_hit_prioritization.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |
-| `03_docking_validation.ipynb` | Phase 3: Docking validation |
-| `py_utils/winnowing.py` | Phase 2 helper (QED + bioavailability + QSAR) |
-| `py_utils/clustering.py` | Phase 2 helper (ALMOS clustering + representatives + exports) |
-| `py_utils/docking.py` | Phase 3 helper (docking + pose scoring + ranking) |
-| `py_utils/inventory.py` | Phase 0 helper (CAS → SMILES → SDF subset) |
-| `scripts/visualize_pose.py` | Pose visualization script (PyMOL-based, HPC-safe) |
-| `synthesis.yml` | Conda environment for Phase 1 (RDKit, pandas) |
-| `clustering.yml` | Conda environment for Phase 2 (ALMOS, scikit-learn) |
-| `docking.yml` | Conda environment for Phase 3 (PyMOL, Vina, RDKit) |
+| `AGENTS.md` | Ground-truth agent instructions |
+| `.env` | Enamine API credentials (gitignored) |
+| `01_LIBRARY_GENERATION.ipynb` | Phase 1: Combinatorial library generation |
+| `02_HIT_PRIORISATION.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |
+| `03_DOCKING_GRADING.ipynb` | Phase 3: Docking grading and scoring |
+| `01_library_mols_data/` | Phase 1 data: SDF building blocks, intermediates, products |
+| `01_library_mols_data/modules/` | Phase 1 package: `io.py`, `filters.py`, `reactions.py`, `enamine_api.py`, `pipeline.py` |
+| `02_selected_mols_data/` | Phase 2 data: IC50 datasets, QED/QSAR intermediates, cluster outputs |
+| `02_selected_mols_data/modules/` | Phase 2 package: `winnowing.py`, `clustering.py`, `prediction.py` |
+| `03_docking_pdbqts_data/` | Phase 3 data: PDB structures, PDBQT intermediates, docking scores |
+| `03_docking_pdbqts_data/modules/` | Phase 3 package: `docking.py` |
+| `figures/` | Figures and affiliation badge |
+| `envs/` | Conda environment files |
+| `LICENSE` | Apache 2.0 |
 
 ## File Naming Convention:
 
@@ -69,18 +68,18 @@ All output files include row counts for clarity and easy identification:
 | Stage | Pattern | Example |
 |-------|---------|---------|
 | **Reaction (raw)** | `{Stage}_raw_{N}cmpds.csv` | `Imidazolones_raw_858270cmpds.csv` |
-| **Reaction checkpoint** | `.cache/{Stage}_checkpoint.json` | `mol_files/3. Oxazolones/.cache/Oxazolones_checkpoint.json` |
+| **Reaction checkpoint** | `.cache/{Stage}_checkpoint.json` | `01_library_mols_data/.interim/02_oxazolones/.cache/Oxazolones_checkpoint.json` |
 | **Veber filter** | `{Stage}_veber_{N}cmpds.csv` | `Oxazolones_veber_4087cmpds.csv` |
 | **Brenk+PAINS filter** | `{Stage}_brenkpains_{N}cmpds.csv` | `Imidazolones_brenkpains_118151cmpds.csv` |
 
 **Example file structure:**
 ```
-mol_files/4. Imidazolones/
-  Imidazolones_raw_858270cmpds.csv        # A-G reaction output
-  Imidazolones_veber_162291cmpds.csv      # After Veber filter
-  Imidazolones_brenkpains_118151cmpds.csv # Final export (Brenk+PAINS)
+01_library_mols_data/.interim/03_imidazolones/
+  Imidazolones_raw_858270cmpds.csv           # A-G reaction output
+  Imidazolones_veber_162291cmpds.csv         # After Veber filter
+  Imidazolones_brenkpains_118151cmpds.csv    # Final export (Brenk+PAINS)
   .cache/
-    Imidazolones_checkpoint.json          # Resume metadata
+    Imidazolones_checkpoint.json             # Resume metadata
   .rejected/
 ```
 
@@ -89,7 +88,7 @@ mol_files/4. Imidazolones/
 The pipeline uses a robust checkpoint system for crash recovery:
 
 - **Reaction outputs**: `{Stage}_raw_{N}cmpds.csv` (row count in filename)
-- **Checkpoints**: `.cache/{Stage}_checkpoint.json` (metadata in `.cache/`)
+- **Checkpoints**: `.cache/{Stage}_checkpoint.json` (metadata in `01_library_mols_data/.interim/*/.cache/`)
 - **Filter outputs**: `{Stage}_{filter}_{N}cmpds.csv` (row count + filter suffix)
 - **Final exports**: `{Stage}_brenkpains_{N}cmpds.csv` (row count + filter suffix)
 
@@ -105,66 +104,68 @@ If the kernel crashes, re-running the notebook will:
 
 ## Phase 2 Outputs (Hit Prioritization):
 
-Notebook `02_hit_prioritization.ipynb` loads Phase 1 products (`*_brenkpains_*cmpds.csv`), adds QED, applies a composite bioavailability filter (Lipinski, Ghose, Egan, Muegge, Veber) with a **4/5 pass threshold**, exports phase-2 accepted/rejected sets under `mol_files/6. QED/`, runs an ML-QSAR winnow stage (COX2/COX1 Random Forest models + applicability domain), exports QSAR accepted/rejected sets under `mol_files/7. QSAR/`, and then runs ALMOS clustering on the QSAR-accepted sets.
+Notebook `02_HIT_PRIORISATION.ipynb` loads Phase 1 products (`*_brenkpains_*cmpds.csv`), adds QED, applies a composite bioavailability filter (Lipinski, Ghose, Egan, Muegge, Veber) with a **4/5 pass threshold**, exports phase-2 accepted/rejected sets under `02_selected_mols_data/.interim/qed/`, runs an ML-QSAR winnow stage (COX2/COX1 Random Forest models + applicability domain), exports QSAR accepted/rejected sets under `02_selected_mols_data/.interim/qsar/`, and then runs ALMOS clustering on the QSAR-accepted sets.
 
 Output paths:
 
-- Accepted imidazolones: `mol_files/6. QED/Imidazolones_{N}cmpds.csv`
-- Accepted thiazolones: `mol_files/6. QED/Thiazolones_{N}cmpds.csv`
-- Rejected imidazolones: `mol_files/6. QED/.rejected/Imidazolones_rejected_bioavailability_{N}cmpds.csv`
-- Rejected thiazolones: `mol_files/6. QED/.rejected/Thiazolones_rejected_bioavailability_{N}cmpds.csv`
+- Accepted imidazolones: `02_selected_mols_data/.interim/qed/Imidazolones_{N}cmpds.csv`
+- Accepted thiazolones: `02_selected_mols_data/.interim/qed/Thiazolones_{N}cmpds.csv`
+- Rejected imidazolones: `02_selected_mols_data/.interim/qed/.rejected/Imidazolones_rejected_bioavailability_{N}cmpds.csv`
+- Rejected thiazolones: `02_selected_mols_data/.interim/qed/.rejected/Thiazolones_rejected_bioavailability_{N}cmpds.csv`
 
 The `Violation` column is inserted after `QED` and stores violated rule names.
 
 QSAR outputs:
 
-- Accepted imidazolones: `mol_files/7. QSAR/Imidazolones_qsar_{N}cmpds.csv`
-- Accepted thiazolones: `mol_files/7. QSAR/Thiazolones_qsar_{N}cmpds.csv`
-- Rejected imidazolones: `mol_files/7. QSAR/.rejected/Imidazolones_rejected_qsar_{N}cmpds.csv`
-- Rejected thiazolones: `mol_files/7. QSAR/.rejected/Thiazolones_rejected_qsar_{N}cmpds.csv`
+- Accepted imidazolones: `02_selected_mols_data/.interim/qsar/Imidazolones_qsar_{N}cmpds.csv`
+- Accepted thiazolones: `02_selected_mols_data/.interim/qsar/Thiazolones_qsar_{N}cmpds.csv`
+- Rejected imidazolones: `02_selected_mols_data/.interim/qsar/.rejected/Imidazolones_rejected_qsar_{N}cmpds.csv`
+- Rejected thiazolones: `02_selected_mols_data/.interim/qsar/.rejected/Thiazolones_rejected_qsar_{N}cmpds.csv`
 
 ## ALMOS Clustering Outputs:
 
-ALMOS clustering consumes the Phase 2 clustering-input files and runs independently for imidazolones and thiazolones. The canonical execution entrypoint is the ALMOS section inside `02_hit_prioritization.ipynb`, backed by `py_utils/clustering.py` (same pipeline stage).
+ALMOS clustering consumes the Phase 2 clustering-input files and runs independently for imidazolones and thiazolones. The canonical execution entrypoint is the ALMOS section inside `02_HIT_PRIORISATION.ipynb`, backed by `02_selected_mols_data/modules/clustering.py`.
 
 Implementation note: ALMOS requires a unique `--name` column. If `ID` contains duplicates, the helper module auto-generates a temporary unique name column (`ALMOS_ID`) for the ALMOS run and maps cluster labels back to the original rows.
 
-Run-level outputs are written to `mol_files/8. Clustering/ALMOS/`:
+Run-level outputs are written to `02_selected_mols_data/.interim/clustering/ALMOS/`:
 
 - Representatives (one per cluster):
-  - `mol_files/8. Clustering/Imidazolones_{K}_samples.csv`
-  - `mol_files/8. Clustering/Thiazolones_{K}_samples.csv`
-- Full clustered imidazolones: `mol_files/8. Clustering/ALMOS/Imidazolones_clusters_k{K}_{N}cmpds.csv`
-- Full clustered thiazolones: `mol_files/8. Clustering/ALMOS/Thiazolones_clusters_k{K}_{N}cmpds.csv`
+  - `02_selected_mols_data/outputs/Imidazolones_{K}_samples.csv`
+  - `02_selected_mols_data/outputs/Thiazolones_{K}_samples.csv`
+- Full clustered imidazolones: `02_selected_mols_data/.interim/clustering/ALMOS/Imidazolones_clusters_k{K}_{N}cmpds.csv`
+- Full clustered thiazolones: `02_selected_mols_data/.interim/clustering/ALMOS/Thiazolones_clusters_k{K}_{N}cmpds.csv`
 - Representatives (with ALMOS metadata):
-  - `mol_files/8. Clustering/ALMOS/Imidazolones_representatives_k{K}_{K}cmpds.csv`
-  - `mol_files/8. Clustering/ALMOS/Thiazolones_representatives_k{K}_{K}cmpds.csv`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Imidazolones_representatives_k{K}_{K}cmpds.csv`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Thiazolones_representatives_k{K}_{K}cmpds.csv`
 - Top-N shortlist for group discussion:
-  - `mol_files/8. Clustering/ALMOS/Imidazolones_shortlist_top{T}_k{K}_{M}cmpds.csv`
-  - `mol_files/8. Clustering/ALMOS/Thiazolones_shortlist_top{T}_k{K}_{M}cmpds.csv`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Imidazolones_shortlist_top{T}_k{K}_{M}cmpds.csv`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Thiazolones_shortlist_top{T}_k{K}_{M}cmpds.csv`
 - Cluster summary tables:
-  - `mol_files/8. Clustering/ALMOS/Imidazolones_cluster_summary_k{K}.csv`
-  - `mol_files/8. Clustering/ALMOS/Thiazolones_cluster_summary_k{K}.csv`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Imidazolones_cluster_summary_k{K}.csv`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Thiazolones_cluster_summary_k{K}.csv`
 - Run metadata JSON:
-  - `mol_files/8. Clustering/ALMOS/Imidazolones_cluster_run_k{K}_{N}cmpds.json`
-  - `mol_files/8. Clustering/ALMOS/Thiazolones_cluster_run_k{K}_{N}cmpds.json`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Imidazolones_cluster_run_k{K}_{N}cmpds.json`
+  - `02_selected_mols_data/.interim/clustering/ALMOS/Thiazolones_cluster_run_k{K}_{N}cmpds.json`
 
-The metadata JSON stores command-line parameters, input SHA256, selected ALMOS outputs, and stdout/stderr log paths from the run folder under `mol_files/8. Clustering/ALMOS/.runs/`.
+The metadata JSON stores command-line parameters, input SHA256, selected ALMOS outputs, and stdout/stderr log paths from the run folder under `02_selected_mols_data/.interim/clustering/ALMOS/.runs/`.
 
-## Phase 3 (Docking Validation):
+## Phase 3 (Docking Grading):
 
-Notebook `03_docking_validation.ipynb` validates QSAR-selected cluster representatives via AutoDock Vina docking. It handles ligand preparation, docking execution, pose validation, geometric scoring, and composite ranking. QSAR modelling and IC₅₀ prediction are handled entirely within `02_hit_prioritization.ipynb`.
+Notebook `03_DOCKING_GRADING.ipynb` validates QSAR-selected cluster representatives via AutoDock Vina docking. It handles ligand preparation, docking execution, pose validation, geometric scoring, and composite ranking. QSAR modelling and IC₅₀ prediction are handled entirely within `02_HIT_PRIORISATION.ipynb`.
+
+Logs and intermediates are stored per receptor under `03_docking_pdbqts_data/.interim/hpc/{receptor}/`. Exported poses and scores go to `03_docking_pdbqts_data/outputs/`.
 
 Representative compounds are loaded from:
-- `mol_files/8. Clustering/Imidazolones_{K}_samples.csv`
-- `mol_files/8. Clustering/Thiazolones_{K}_samples.csv`
+- `02_selected_mols_data/outputs/Imidazolones_{K}_samples.csv`
+- `02_selected_mols_data/outputs/Thiazolones_{K}_samples.csv`
 
 QSAR predictions produced by Phase 2 are available at:
-- `protein_files/Machine Learning/qsar_predictions.csv`
+- `02_selected_mols_data/.interim/qsar/qsar_predictions.csv`
 
 ### Visualization:
 
-Pose visualization uses `scripts/visualize_pose.py`, a standalone PyMOL-based script that:
+Pose visualization is handled by `render_top_poses` in `03_docking_pdbqts_data/modules/docking.py`, a PyMOL-based function that:
 - Converts ligand PDBQT → PDB via Open Babel
 - Renders receptor (cartoon, light blue) and ligand (sticks, magenta)
 - Outputs 1200×900 PNG at 300 DPI
