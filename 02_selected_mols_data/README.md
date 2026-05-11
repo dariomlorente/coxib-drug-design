@@ -129,7 +129,7 @@ the rest are saved to `.rejected/`. Model training is cached, so reruns are fast
 **Diversity clustering (Step 16):** after QSAR ranking, many similar molecules remain.
 Clustering groups them by chemical similarity and one representative is chosen per group,
 ensuring the final shortlist covers the widest possible range of structures. The clustering
-tool is [ALMOS](https://github.com/jnpco98/almos-kit), and it runs separately for each
+tool is [ALMOS](https://github.com/MiguelMartzFdez/almos), and it runs separately for each
 scaffold family.
 
 ---

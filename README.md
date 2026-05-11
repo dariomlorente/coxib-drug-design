@@ -34,15 +34,15 @@ conda env create -f envs/docking.yml
 
 ### 01_library_generation.png
 ![1st Phase Flowdiagram](01_library_mols_data/inputs/.visuals/01_library_generation.png)
-Flowchart of the Jupyter Notebook `01_LIBRARY_GENERATION.ipynb`
+Flowchart of the Jupyter Notebook [`01_LIBRARY_GENERATION.ipynb`](03_DOCKING_GRADING.ipynb)
 
 ### 02_hit_prioritisation.png
 ![2nd Phase Flowdiagram](02_selected_mols_data/inputs/.visuals/02_hit_prioritisation.png)
-Flowchart of the Jupyter Notebook `02_HIT_PRIORITISATION.ipynb`
+Flowchart of the Jupyter Notebook [`02_HIT_PRIORITISATION.ipynb`](03_DOCKING_GRADING.ipynb)
 
 ### 03_docking_grading.png
 ![3rd Phase Flowdiagram](03_docking_pdbqts_data/inputs/.visuals/03_docking_grading.png)
-Flowchart of the Jupyter Notebook 03_DOCKING_GRADING.ipynb
+Flowchart of the Jupyter Notebook [`03_DOCKING_GRADING.ipynb`](03_DOCKING_GRADING.ipynb)
 
 ## Computational Pipeline:
 
