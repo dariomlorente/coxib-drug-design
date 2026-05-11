@@ -10,7 +10,7 @@ a large set of drug-like molecules and filter them down to a focused, purchasabl
 
 ## What this phase produces
 
-Two CSV files, one per scaffold family, exported to `01_library_mols_data/outputs/`:
+Two CSV files, one per scaffold family, exported to [`01_library_mols_data/outputs/`](outputs):
 
 - `Imidazolones_{N}cmpds.csv`
 - `Thiazolones_{N}cmpds.csv`
@@ -21,10 +21,10 @@ These are the compounds that survive every filter and are ready for Phase 2 (hit
 
 ## How to run it
 
-Phase 1 requires the `synthesis` conda environment:
+Phase 1 requires the [`synthesis`](modules/synthesis.yml) conda environment:
 
 ```bash
-conda env create -f ...coxib-drug-design/01_library_mols_data/modules/synthesis.yml
+conda env create -f 01_library_mols_data/modules/synthesis.yml
 conda activate synthesis
 ```
 
@@ -53,7 +53,7 @@ The notebook runs ten steps in sequence:
 | 7 | **Sulphur exchange**: convert oxazolones to thiazolones |
 | 8 | Filter both product families for drug-likeness (descriptors recomputed from scratch) |
 | 9 | Remove compounds containing structural alerts (Brenk) or assay-interference patterns (PAINS) |
-| 10 | Export final libraries to `outputs/` |
+| 10 | Export final libraries to [`outputs/`](outputs) |
 
 Steps 4, 6, and 7 are computationally heavy. They are automatically split into chunks and
 checkpointed, so the notebook can recover from a crash without restarting from zero.
@@ -145,16 +145,16 @@ the mismatch via a stored hash and triggers a recompute automatically.
 
 ## Modules reference
 
-The `modules/` package is the implementation layer behind the notebook.
+The [`modules/`](modules) package is the implementation layer behind the notebook.
 You should not need to edit these files directly during a normal run.
 
 | Module | Role |
 |--------|------|
-| `io.py` | Reads SDF files and computes RDKit molecular descriptors |
-| `enamine_api.py` | Enamine Store API client, batch price queries, and price caching |
-| `filters.py` | Veber drug-likeness filter and Brenk + PAINS structural alert filter |
-| `reactions.py` | Orchestrates the three reactions (EP, AG, SE) with chunking and resume logic |
-| `pipeline.py` | Stage paths, checkpoint management, `load_or_run`, `load_or_filter` |
-| `_reaction_workers.py` | Low-level batch workers and SMARTS templates called by `reactions.py` |
-| `_smarts_catalog.py` | Brenk and PAINS SMARTS pattern catalogue used by `filters.py` |
-| `_utils.py` | Shared utilities: cache I/O, worker count, and canonical folder paths |
+| [`io.py/`](modules/io.py) | Reads SDF files and computes RDKit molecular descriptors |
+| [`enamine_api.py/`](modules/enamine_api.py) | Enamine Store API client, batch price queries, and price caching |
+| [`filters.py/`](modules/filters.py) | Veber drug-likeness filter and Brenk + PAINS structural alert filter |
+| [`reactions.py/`](modules/reactions.py) | Orchestrates the three reactions (EP, AG, SE) with chunking and resume logic |
+| [`pipeline.py/`](modules/pipeline.py) | Stage paths, checkpoint management, `load_or_run`, `load_or_filter` |
+| [`_reaction_workers.py/`](modules/_reaction_workers.py) | Low-level batch workers and SMARTS templates called by `reactions.py` |
+| [`_smarts_catalog.py/`](modules/_smarts_catalog.py) | Brenk and PAINS SMARTS pattern catalogue used by `filters.py` |
+| [`_utils.py/`](modules/_utils.py) | Shared utilities: cache I/O, worker count, and canonical folder paths |
