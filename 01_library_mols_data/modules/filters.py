@@ -174,7 +174,7 @@ def filter_Veber(
 
     if use_cache:
         if cache_file is None:
-            from ._paths import REACTION_CACHE
+            from ._utils import REACTION_CACHE
 
             cache_file = Path(REACTION_CACHE) / "veber_filter_cache.json.gz"
         else:

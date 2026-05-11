@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ._paths import STAGE_REGISTRY as _STAGE_REGISTRY
+from ._utils import STAGE_REGISTRY as _STAGE_REGISTRY
 
 
 def stage_path(
@@ -775,7 +775,7 @@ def _get_checkpoint(stage_name: str, output_dir: Path) -> CheckpointManager:
 
 def _get_stage_dir(stage_name: str) -> Path:
     """Get the directory for a stage based on name."""
-    from ._paths import STAGE_REGISTRY
+    from ._utils import STAGE_REGISTRY
 
     base = STAGE_REGISTRY.get(stage_name)
     if base is not None:

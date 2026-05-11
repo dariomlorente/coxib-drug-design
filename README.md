@@ -1,4 +1,4 @@
-![@TheAlegreGroup](figures/.affiliation.png)
+![@TheAlegreGroup](01_library_mols_data/inputs/.visuals/.affiliation.png)
 
 # Bachelor's Thesis — Coxib Drug Design
 
@@ -30,6 +30,20 @@ conda env create -f envs/clustering.yml
 conda env create -f envs/docking.yml
 ```
 
+## Flowdiagrams
+
+### 01_library_generation.png
+![1st Phase Flowdiagram](01_library_mols_data/inputs/.visuals/01_library_generation.png)
+Flowchart of the Jupyter Notebook `01_LIBRARY_GENERATION.ipynb`
+
+### 02_hit_prioritisation.png
+![2nd Phase Flowdiagram](02_selected_mols_data/inputs/.visuals/02_hit_prioritisation.png)
+Flowchart of the Jupyter Notebook `02_HIT_PRIORITISATION.ipynb`
+
+### 03_docking_grading.png
+![3rd Phase Flowdiagram](03_docking_pdbqts_data/inputs/.visuals/03_docking_grading.png)
+Flowchart of the Jupyter Notebook 03_DOCKING_GRADING.ipynb
+
 ## Computational Pipeline:
 
 Building blocks (aldehydes, carboxylic acids, and amines) are retrieved from the Enamine commercial catalogue and filtered by price and bioavailability (Veber criteria). A hard global molecular-price cutoff is also enforced (`PriceMol <= MAX_PRICE_MOL`, currently `200.00`) in Veber filters and reaction pairing. Filtered sets are then combined through three encoded reaction pathways. The resulting products (imidazolones and thiazolones) are filtered for structural alerts (Brenk + PAINS) before export:
@@ -46,7 +60,6 @@ Reactions are implemented as RDKit SMARTS templates. The resulting library is re
 
 | Path | Description |
 |------|-------------|
-| `AGENTS.md` | Ground-truth agent instructions |
 | `.env` | Enamine API credentials (gitignored) |
 | `01_LIBRARY_GENERATION.ipynb` | Phase 1: Combinatorial library generation |
 | `02_HIT_PRIORISATION.ipynb` | Phase 2: Hit prioritization + ALMOS clustering |

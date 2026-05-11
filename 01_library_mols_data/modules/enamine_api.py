@@ -47,7 +47,7 @@ _load_dotenv()
 _ENAMINE_EMAIL = os.environ.get("ENAMINE_EMAIL", "")
 _ENAMINE_PASSWORD = os.environ.get("ENAMINE_PASSWORD", "")
 
-from ._paths import PRICE_CACHE
+from ._utils import PRICE_CACHE
 
 # Cache directory
 DEFAULT_CACHE_DIR = PRICE_CACHE
