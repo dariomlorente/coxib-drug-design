@@ -595,3 +595,149 @@ def extract_ic50_by_target(
             )
 
     return row_counts, output_paths
+
+
+# =============================================================================
+# IC50Analyzer
+# =============================================================================
+
+
+class IC50Analyzer:
+    """
+    Orchestrates the full ChEMBL IC50 extraction and merging pipeline.
+
+    Wraps extract_ic50_by_target(), merge_ic50_summary(),
+    merge_ic50_into_csv(), and find_chembl_ids_by_smarts() into a single
+    stateful object.
+
+    Parameters
+    ----------
+    input_dir : str or Path
+        Directory containing raw ChEMBL CSV exports.
+    output_dir : str or Path
+        Directory for per-target IC50 CSVs and merged summary.
+    target_ids : sequence of str, optional
+        ChEMBL target IDs to extract. Default: ("CHEMBL221", "CHEMBL230").
+    allowed_bao_labels : sequence of str, optional
+        BAO labels accepted for IC50 filtering. Default: DEFAULT_BAO_LABELS.
+    """
+
+    def __init__(
+        self,
+        input_dir: str | Path,
+        output_dir: str | Path,
+        target_ids: Sequence[str] = DEFAULT_TARGET_IDS,
+        allowed_bao_labels: Sequence[str] = DEFAULT_BAO_LABELS,
+    ) -> None:
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.target_ids = target_ids
+        self.allowed_bao_labels = allowed_bao_labels
+        self._extracted: tuple[dict[str, int], dict[str, Path]] | None = None
+        self._summary: pd.DataFrame | None = None
+
+    def extract(
+        self,
+    ) -> tuple[dict[str, int], dict[str, Path]]:
+        """
+        Extract IC50 rows for configured ChEMBL targets.
+
+        Delegates to extract_ic50_by_target(). Stores the result as
+        ``self._extracted``.
+
+        Returns
+        -------
+        tuple[dict[str, int], dict[str, Path]]
+            (row_counts, output_paths) mapping target ID to counts and paths.
+        """
+        result = extract_ic50_by_target(
+            input_dir=self.input_dir,
+            output_dir=self.output_dir,
+            target_ids=self.target_ids,
+        )
+        self._extracted = result
+        return result
+
+    def merge(
+        self,
+        cox1_csv: str | Path,
+        cox2_csv: str | Path,
+        output_csv: str | Path,
+    ) -> pd.DataFrame:
+        """
+        Merge IC50 summaries for COX1 and COX2 into a single table.
+
+        Delegates to merge_ic50_summary(). Stores the result as
+        ``self._summary``.
+
+        Parameters
+        ----------
+        cox1_csv : str or Path
+            Path to CHEMBL221 IC50 CSV.
+        cox2_csv : str or Path
+            Path to CHEMBL230 IC50 CSV.
+        output_csv : str or Path
+            Path to write the merged summary CSV.
+
+        Returns
+        -------
+        pd.DataFrame
+            Merged IC50 summary DataFrame.
+        """
+        result = merge_ic50_summary(
+            cox1_csv=cox1_csv,
+            cox2_csv=cox2_csv,
+            output_csv=output_csv,
+            allowed_bao_labels=self.allowed_bao_labels,
+        )
+        self._summary = result
+        return result
+
+    def merge_into(
+        self,
+        input_csv: str | Path,
+        **kwargs: Any,
+    ) -> Path:
+        """
+        Merge IC50 summary metrics into a compound CSV by matching SMILES.
+
+        Delegates to merge_ic50_into_csv().
+
+        Parameters
+        ----------
+        input_csv : str or Path
+            Input CSV path (comma-delimited).
+        **kwargs
+            Additional keyword arguments forwarded to merge_ic50_into_csv().
+
+        Returns
+        -------
+        Path
+            Path to the merged output CSV.
+        """
+        return merge_ic50_into_csv(input_csv, **kwargs)
+
+    def find_by_smarts(
+        self,
+        smarts: str,
+        **kwargs: Any,
+    ) -> Path:
+        """
+        Export ChEMBL entries whose SMILES match a SMARTS substructure.
+
+        Delegates to find_chembl_ids_by_smarts().
+
+        Parameters
+        ----------
+        smarts : str
+            SMARTS pattern to match.
+        **kwargs
+            Additional keyword arguments forwarded to
+            find_chembl_ids_by_smarts().
+
+        Returns
+        -------
+        Path
+            Path to the output CSV.
+        """
+        return find_chembl_ids_by_smarts(smarts=smarts, **kwargs)

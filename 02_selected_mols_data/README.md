@@ -140,7 +140,7 @@ scaffold family.
 you are in the `clustering` environment. Detailed logs are saved to
 `.interim/ALMOS/.runs/<timestamp>/almos_stdout.log` and `almos_stderr.log`.
 
-**Stale QSAR cache** — if you update `inputs/COX1&2_IC50.csv`, delete
+**Stale QSAR cache** — if you update [`inputs/COX1&2_IC50.csv`](inputs/COX1&2_IC50.csv), delete
 `.interim/qsar/.cache/qsar_models.json.gz` to force the models to retrain on the new data.
 
 **Stale QED cache** — if input molecules change but the row count stays the same,

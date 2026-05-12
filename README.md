@@ -21,19 +21,19 @@ To ensure the resulting candidates are practical for real-world laboratory synth
 
 The workflow is divided into three sequential phases, each orchestrated by a dedicated Jupyter Notebook. The process moves from massive virtual combinatorial chemistry down to precise 3D structural evaluation.
 
-### [Phase 1: Virtual Library Generation](01_LIBRARY_GENERATION.ipynb)
+### [Phase 1: Virtual Library Generation](01_library_mols_data)
 **Objective:** Synthesize a vast *in silico* library and remove impractical or toxic compounds.
 * **Combinatorial Synthesis:** Assembles virtual compounds using three reaction pathways (Erlenmeyer–Plöchl, Aminolysis, and Sulphur exchange) based on commercial aldehydes, carboxylic acids, and amines.
 * **Economic Constraints:** Integrates live data from the Enamine Store API to immediately discard reactions exceeding a strict molecular budget.
 * **Drug-likeness & Safety:** Applies rigorous ADMET filtering, including Veber criteria for oral bioavailability, and Brenk/PAINS filters to remove structural alerts and assay-interfering motifs.
 
-### [Phase 2: Hit Prioritisation](02_HIT_PRIORITISATION.ipynb)
+### [Phase 2: Hit Prioritisation](02_selected_mols_data)
 **Objective:** Narrow the library to a small, diverse, and highly promising shortlist.
 * **Bioavailability Profiling:** Enforces a composite filter requiring compounds to pass at least 4 out of 5 established pharmaceutical rule sets (Lipinski, Ghose, Egan, Muegge, Veber).
 * **Machine Learning (QSAR):** Deploys Random Forest models trained on ChEMBL biological assay data. Every compound is ranked by its predicted ability to potently inhibit COX-2 while sparing COX-1.
-* **Chemical Clustering:** Utilizes ALMOS to cluster the top-scoring compounds by structural similarity, extracting only the most diverse representative candidates to avoid testing redundant molecules.
+* **Chemical Clustering:** Utilizes [ALMOS](https://github.com/MiguelMartzFdez/almos) to cluster the top-scoring compounds by structural similarity, extracting only the most diverse representative candidates to avoid testing redundant molecules.
 
-### [Phase 3: Docking & Grading](03_DOCKING_GRADING.ipynb)
+### [Phase 3: Docking & Grading](03_docking_pdbqts_data)
 **Objective:** Validate candidates through 3D structural simulation against the target proteins.
 * **Molecular Docking:** Utilizes AutoDock Vina to simulate how each candidate binds to the 3D crystal structures of both COX-2 (therapeutic target) and COX-1 (off-target).
 * **Geometric Scoring:** Analyzes the predicted binding poses for critical molecular interactions, such as anchoring to Arg120/Tyr355 and the successful occupation of the COX-2 specific side-pocket.
@@ -90,4 +90,4 @@ For a detailed view of the data structures, caching mechanisms, and logic gates 
 ![3rd Phase Flowdiagram](03_docking_pdbqts_data/inputs/.visuals/03_docking_grading.png)
 
 ---
-*Distributed under the Apache 2.0 License. See `LICENSE` for more information.*
+*Distributed under the Apache 2.0 License. See [`LICENSE`](LICENSE) for more information.*

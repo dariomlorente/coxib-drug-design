@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -418,3 +419,142 @@ def compute_final_ranking(
     print("[compute_final_ranking] Formula: final_score = 0.5*qsar_norm + 0.4*geo_norm + 0.1*vina_norm")
 
     return df_ranked
+
+
+# =============================================================================
+# DockingScorer
+# =============================================================================
+
+
+class DockingScorer:
+    """
+    Computes composite docking scores and final compound rankings.
+
+    Wraps compute_docking_analysis(), compute_composite_score(), and
+    compute_final_ranking(). Stores instability_lambda at construction time.
+
+    Parameters
+    ----------
+    instability_lambda : float, optional
+        Weight for the instability penalty term in MD_score formula.
+        Recommended range: 0.1–0.3. Default: 0.2.
+    """
+
+    def __init__(self, instability_lambda: float = 0.2) -> None:
+        self.instability_lambda = instability_lambda
+        self.df_analysis: pd.DataFrame | None = None
+        self.df_composite: pd.DataFrame | None = None
+
+    def analyse(
+        self,
+        df_scores: pd.DataFrame,
+        df_instability: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Compute docking analysis metrics from parsed scores and instability.
+
+        Delegates to compute_docking_analysis().  Stores the result as
+        ``self.df_analysis``.
+
+        Parameters
+        ----------
+        df_scores : pd.DataFrame
+            DataFrame with ligand_id, cox_label, docking_score.
+        df_instability : pd.DataFrame
+            DataFrame with ligand_id, cox_label, pose_spread.
+
+        Returns
+        -------
+        pd.DataFrame
+            Pivot DataFrame with score_cox2, score_cox1, instability.
+        """
+        result = compute_docking_analysis(df_scores, df_instability)
+        self.df_analysis = result
+        return result
+
+    def composite(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute MD_score composite ranking.
+
+        Delegates to compute_composite_score() with stored
+        instability_lambda.  Stores the result as ``self.df_composite``.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with score_cox2, score_cox1, instability columns.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame sorted by md_score descending.
+        """
+        result = compute_composite_score(df, instability_lambda=self.instability_lambda)
+        self.df_composite = result
+        return result
+
+    def rank(
+        self,
+        df_best_poses: pd.DataFrame,
+        df_ligands_raw: pd.DataFrame,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """
+        Compute final ranking with normalised scores.
+
+        Delegates to compute_final_ranking().  Only ``qsar_col`` and
+        ``id_col`` are forwarded; all other kwargs are silently ignored
+        (``compute_final_ranking`` has a fixed parameter list).
+
+        Parameters
+        ----------
+        df_best_poses : pd.DataFrame
+            DataFrame with best poses per ligand-receptor pair.
+        df_ligands_raw : pd.DataFrame
+            Original DataFrame with QSAR_score.
+        **kwargs
+            Only ``qsar_col`` and ``id_col`` are forwarded to
+            compute_final_ranking().
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame sorted by final_score descending.
+        """
+        accepted = {"qsar_col", "id_col"}
+        safe_kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+        return compute_final_ranking(df_best_poses, df_ligands_raw, **safe_kwargs)
+
+    def run_full(
+        self,
+        df_scores: pd.DataFrame,
+        df_instability: pd.DataFrame,
+        df_ligands_raw: pd.DataFrame,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """
+        Run the full docking scoring pipeline.
+
+        Chains .analyse() -> .composite() -> .rank() in sequence.
+        Intermediate results are stored as ``self.df_analysis`` and
+        ``self.df_composite``.
+
+        Parameters
+        ----------
+        df_scores : pd.DataFrame
+            Scores DataFrame with ligand_id, cox_label, docking_score.
+        df_instability : pd.DataFrame
+            Instability DataFrame with ligand_id, cox_label, pose_spread.
+        df_ligands_raw : pd.DataFrame
+            Original DataFrame with QSAR_score.
+        **kwargs
+            Additional keyword arguments forwarded to .rank().
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame sorted by final_score descending.
+        """
+        self.df_analysis = self.analyse(df_scores, df_instability)
+        self.df_composite = self.composite(self.df_analysis)
+        return self.rank(df_scores, df_ligands_raw, **kwargs)

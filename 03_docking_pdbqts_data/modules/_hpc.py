@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os.path
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -356,3 +357,153 @@ def save_md_candidates(
     output_path.write_text("\n".join(ligand_ids) + "\n")
     print(f"[save_md_candidates] Saved {len(ligand_ids)} candidates to {os.path.relpath(output_path)}")
     return output_path
+
+
+# =============================================================================
+# HPCJobGenerator
+# =============================================================================
+
+
+class HPCJobGenerator:
+    """
+    Generates SLURM array job scripts for docking, MM-GBSA rescoring, and MD.
+
+    Wraps generate_docking_slurm(), generate_rescore_slurm(), and
+    generate_md_slurm(). Stores partition, account, and base_dir at
+    construction time so all scripts for a given cluster share the same
+    SLURM configuration.
+
+    Parameters
+    ----------
+    partition : str, optional
+        SLURM partition name. Default: "normal".
+    account : str or None, optional
+        SLURM account. Default: None.
+    base_dir : str or Path, optional
+        Base HPC directory for all output paths.
+        Default: "03_docking_pdbqts_data/.interim/hpc".
+    """
+
+    def __init__(
+        self,
+        partition: str = "normal",
+        account: str | None = None,
+        base_dir: str | Path = "03_docking_pdbqts_data/.interim/hpc",
+    ) -> None:
+        self.partition = partition
+        self.account = account
+        self.base_dir = base_dir
+
+    def docking_script(
+        self,
+        mapping_csv: str | Path,
+        slurm_dir: str | Path,
+        n_tasks: int,
+        **kwargs: Any,
+    ) -> Path:
+        """
+        Generate a SLURM array job script for AutoDock Vina docking.
+
+        Delegates to generate_docking_slurm() with stored partition,
+        account, and base_dir.  All kwargs forwarded directly.
+
+        Parameters
+        ----------
+        mapping_csv : str or Path
+            Path to mapping.csv with task_id, ligand_id, receptor_id.
+        slurm_dir : str or Path
+            Output directory for the SLURM script.
+        n_tasks : int
+            Number of docking tasks.
+        **kwargs
+            Additional keyword arguments forwarded to
+            generate_docking_slurm() (e.g. vina_exe).
+
+        Returns
+        -------
+        Path
+            Path to the generated .sh script.
+        """
+        from ._docking import generate_docking_slurm
+
+        return generate_docking_slurm(
+            mapping_csv,
+            slurm_dir,
+            n_tasks,
+            base_dir=self.base_dir,
+            partition=self.partition,
+            account=self.account,
+            **kwargs,
+        )
+
+    def rescore_script(
+        self,
+        slurm_dir: str | Path,
+        n_tasks: int,
+        **kwargs: Any,
+    ) -> Path:
+        """
+        Generate a SLURM array job script for MM-GBSA rescoring.
+
+        Delegates to generate_rescore_slurm() with stored partition,
+        account, and base_dir.  All kwargs forwarded directly.
+
+        Parameters
+        ----------
+        slurm_dir : str or Path
+            Output directory for the SLURM script.
+        n_tasks : int
+            Number of rescore tasks.
+        **kwargs
+            Additional keyword arguments forwarded to
+            generate_rescore_slurm() (e.g. n_snapshots).
+
+        Returns
+        -------
+        Path
+            Path to the generated .sh script.
+        """
+        return generate_rescore_slurm(
+            slurm_dir,
+            n_tasks,
+            base_dir=self.base_dir,
+            partition=self.partition,
+            account=self.account,
+            **kwargs,
+        )
+
+    def md_script(
+        self,
+        candidates_txt: str | Path,
+        slurm_dir: str | Path,
+        **kwargs: Any,
+    ) -> Path:
+        """
+        Generate a SLURM array job script for MD validation.
+
+        Delegates to generate_md_slurm() with stored partition, account,
+        and base_dir.  All kwargs forwarded directly.
+
+        Parameters
+        ----------
+        candidates_txt : str or Path
+            Path to file with one ligand ID per line.
+        slurm_dir : str or Path
+            Output directory for the SLURM script.
+        **kwargs
+            Additional keyword arguments forwarded to
+            generate_md_slurm() (e.g. production_ns).
+
+        Returns
+        -------
+        Path
+            Path to the generated .sh script.
+        """
+        return generate_md_slurm(
+            candidates_txt,
+            slurm_dir,
+            base_dir=self.base_dir,
+            partition=self.partition,
+            account=self.account,
+            **kwargs,
+        )

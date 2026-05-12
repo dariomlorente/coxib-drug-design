@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -320,3 +321,119 @@ def extract_all_docking_scores(
             })
 
     return pd.DataFrame(records)
+
+
+# =============================================================================
+# DockingResultParser
+# =============================================================================
+
+
+class DockingResultParser:
+    """
+    Parses, validates, and extracts scores from AutoDock Vina output files.
+
+    Wraps parse_docking_logs(), validate_docking_poses(), and
+    extract_all_docking_scores(). Stores receptor_map and n_modes at
+    construction time so the same parser handles all receptors consistently.
+
+    Parameters
+    ----------
+    receptor_map : dict[str, str] or None, optional
+        Mapping from receptor_id to cox_label.
+        Default: {"6COX": "COX2", "3KK6": "COX1"}.
+    n_modes : int, optional
+        Maximum number of poses to extract per log file. Default: 3.
+    """
+
+    def __init__(
+        self,
+        receptor_map: dict[str, str] | None = None,
+        n_modes: int = 3,
+    ) -> None:
+        if receptor_map is None:
+            receptor_map = {"6COX": "COX2", "3KK6": "COX1"}
+        self.receptor_map = receptor_map
+        self.n_modes = n_modes
+
+    def parse(
+        self,
+        results_dir: str | Path,
+        logs_dir: str | Path,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Parse Vina log files and extract docking scores and pose instability.
+
+        Delegates to parse_docking_logs() with stored receptor_map.
+
+        Parameters
+        ----------
+        results_dir : str or Path
+            Directory containing Vina pose output files.
+        logs_dir : str or Path
+            Directory containing Vina log files.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame]
+            (df_scores, df_instability).
+        """
+        return parse_docking_logs(results_dir, logs_dir, receptor_map=self.receptor_map)
+
+    def validate(
+        self,
+        mapping_csv: str | Path,
+        logs_dir: str | Path,
+        results_dir: str | Path,
+        **kwargs: Any,
+    ) -> dict:
+        """
+        Three-layer validation of docking completion.
+
+        Delegates to validate_docking_poses().  All kwargs forwarded
+        directly.
+
+        Parameters
+        ----------
+        mapping_csv : str or Path
+            Path to the docking mapping CSV.
+        logs_dir : str or Path
+            Directory containing Vina log files.
+        results_dir : str or Path
+            Directory containing Vina pose output files.
+        **kwargs
+            Additional keyword arguments forwarded to
+            validate_docking_poses().
+
+        Returns
+        -------
+        dict
+            Validation result dict with status, counts, and details.
+        """
+        return validate_docking_poses(mapping_csv, logs_dir, results_dir, **kwargs)
+
+    def extract(
+        self,
+        logs_dir: str | Path,
+    ) -> pd.DataFrame:
+        """
+        Extract all docking scores (all poses) from Vina logs.
+
+        Delegates to extract_all_docking_scores() with stored receptor_map
+        and n_modes.
+
+        Parameters
+        ----------
+        logs_dir : str or Path
+            Directory containing Vina log files.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns: ligand_id, receptor_id, cox_label,
+            pose_rank, docking_score.
+        """
+        return extract_all_docking_scores(
+            logs_dir,
+            receptor_map=self.receptor_map,
+            n_modes=self.n_modes,
+        )

@@ -5,6 +5,7 @@ import os.path
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -386,3 +387,95 @@ def prepare_receptor(
         "box_json": str(box_out),
     }
     return out
+
+
+# =============================================================================
+# ReceptorPreparator
+# =============================================================================
+
+
+class ReceptorPreparator:
+    """
+    Cleans PDB files, locates binding sites, and generates receptor PDBQTs.
+
+    Wraps prepare_receptor() and get_binding_site_center(). Stores
+    receptor_dir and box_size at construction time so the same preparator
+    can be reused across multiple receptors with consistent box dimensions.
+
+    Parameters
+    ----------
+    receptor_dir : str or Path
+        Output directory for receptor files (PDBQTs, box JSONs).
+    box_size : float, optional
+        Binding box cube size in Angstroms. Default: 24.0.
+    """
+
+    def __init__(
+        self,
+        receptor_dir: str | Path,
+        box_size: float = 24.0,
+    ) -> None:
+        self.receptor_dir = receptor_dir
+        self.box_size = box_size
+
+    def prepare(
+        self,
+        pdb_path: str | Path,
+        receptor_id: str,
+        **kwargs: Any,
+    ) -> dict:
+        """
+        Clean a PDB file, compute binding box, and generate receptor PDBQT.
+
+        Delegates to prepare_receptor() with stored receptor_dir and
+        box_size.  Remaining kwargs are forwarded directly.
+
+        Parameters
+        ----------
+        pdb_path : str or Path
+            Path to the source PDB file.
+        receptor_id : str
+            Identifier for the receptor (e.g. '6COX', '3KK6').
+        **kwargs
+            Additional keyword arguments forwarded to prepare_receptor()
+            (e.g. ligand_resname, override_box, reference_pdb).
+
+        Returns
+        -------
+        dict
+            Dict with receptor_id, pdbqt_path, box_center, box_size.
+        """
+        return prepare_receptor(
+            pdb_path,
+            self.receptor_dir,
+            receptor_id,
+            box_size=self.box_size,
+            **kwargs,
+        )
+
+    def get_center(
+        self,
+        pdb_path: str | Path,
+        **kwargs: Any,
+    ) -> list[float]:
+        """
+        Compute binding site center for a receptor.
+
+        Delegates to get_binding_site_center().  All kwargs forwarded
+        directly.
+
+        Parameters
+        ----------
+        pdb_path : str or Path
+            Path to the PDB file.
+        **kwargs
+            Additional keyword arguments forwarded to
+            get_binding_site_center()
+            (e.g. ligand_resname, reference_pdb, reference_center).
+
+        Returns
+        -------
+        list[float]
+            [x, y, z] center coordinates.
+        """
+        return get_binding_site_center(pdb_path, **kwargs)

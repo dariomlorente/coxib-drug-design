@@ -5,6 +5,7 @@ import os.path
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -69,6 +70,72 @@ def write_mapping_csv(
     return mapping_csv
 
 
+def _run_single_docking_task(task_args: dict) -> dict:
+    """
+    Run a single Vina docking task (module-level for picklability).
+
+    Parameters:
+        task_args: Dict with keys: vina_exe_path, ligand_pdbqt, receptor_pdbqt,
+            box, seed, log_path, pose_path, timeout, exhaustiveness, num_modes,
+            n_cpu, ligand_id, receptor_id.
+
+    Returns:
+        Dict with keys: status ('done' | 'failed'), ligand_id, receptor_id,
+        and optionally 'error'.
+    """
+    vina_exe_path = task_args["vina_exe_path"]
+    ligand_pdbqt = task_args["ligand_pdbqt"]
+    receptor_pdbqt = task_args["receptor_pdbqt"]
+    box = task_args["box"]
+    seed = task_args["seed"]
+    log_path = task_args["log_path"]
+    pose_path = task_args["pose_path"]
+    timeout = task_args["timeout"]
+    exhaustiveness = task_args["exhaustiveness"]
+    num_modes = task_args["num_modes"]
+    n_cpu = task_args["n_cpu"]
+    ligand_id = task_args["ligand_id"]
+    receptor_id = task_args["receptor_id"]
+
+    cmd = [
+        vina_exe_path,
+        "--receptor", str(receptor_pdbqt),
+        "--ligand", str(ligand_pdbqt),
+        "--center_x", str(box["center_x"]),
+        "--center_y", str(box["center_y"]),
+        "--center_z", str(box["center_z"]),
+        "--size_x", str(box["size_x"]),
+        "--size_y", str(box["size_y"]),
+        "--size_z", str(box["size_z"]),
+        "--cpu", str(n_cpu),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes", str(num_modes),
+        "--out", str(pose_path),
+    ]
+    if seed is not None:
+        cmd.extend(["--seed", str(seed)])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        with open(log_path, "w") as f:
+            f.write(result.stdout)
+            if result.stderr:
+                f.write(result.stderr)
+
+        if result.returncode == 0:
+            return {"status": "done", "ligand_id": ligand_id, "receptor_id": receptor_id}
+        return {
+            "status": "failed",
+            "ligand_id": ligand_id,
+            "receptor_id": receptor_id,
+            "error": result.stderr[:200],
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "failed", "ligand_id": ligand_id, "receptor_id": receptor_id, "error": "timeout"}
+    except Exception:
+        return {"status": "failed", "ligand_id": ligand_id, "receptor_id": receptor_id, "error": "exception"}
+
+
 def run_local_docking(
     mapping_df: pd.DataFrame,
     dirs: dict[str, Path],
@@ -80,6 +147,7 @@ def run_local_docking(
     timeout: int = 300,
     force_redock: bool = False,
     seed: int = 42,
+    n_workers: int | None = None,
 ) -> dict:
     """
     Run Vina docking locally for each task in the mapping DataFrame.
@@ -96,6 +164,9 @@ def run_local_docking(
         timeout: Per-docking timeout in seconds.
         force_redock: Re-run even if output files already exist.
         seed: Random seed.
+        n_workers: Number of parallel Vina jobs. Each job uses n_cpu cores.
+            When None, computed automatically as max(1, cpu_count // n_cpu)
+            to fill all available cores. Set to 1 to disable parallelism.
 
     Returns:
         Dict with counts: completed, skipped, failed, total, total_time_min.
@@ -133,9 +204,11 @@ def run_local_docking(
     n_total = len(mapping_df)
     start = time.time()
 
-    for _, task in mapping_df.iterrows():
-        ligand_id = task["ligand_id"]
-        receptor_id = task["receptor_id"]
+    # Build task list with pre-flight skip/fail checks
+    task_list: list[dict] = []
+    for _, task_row in mapping_df.iterrows():
+        ligand_id = task_row["ligand_id"]
+        receptor_id = task_row["receptor_id"]
 
         logs_dir = dirs[f"docking_logs_{receptor_id}"]
         poses_dir = dirs[f"docking_poses_{receptor_id}"]
@@ -155,37 +228,54 @@ def run_local_docking(
             n_failed += 1
             continue
 
-        cmd = [
-            vina_exe_path,
-            "--receptor", str(receptor_pdbqt),
-            "--ligand", str(ligand_pdbqt),
-            "--center_x", str(box["center_x"]),
-            "--center_y", str(box["center_y"]),
-            "--center_z", str(box["center_z"]),
-            "--size_x", str(box["size_x"]),
-            "--size_y", str(box["size_y"]),
-            "--size_z", str(box["size_z"]),
-            "--cpu", str(n_cpu),
-            "--exhaustiveness", str(exhaustiveness),
-            "--num_modes", str(num_modes),
-            "--out", str(pose_path),
-        ]
+        task_list.append({
+            "vina_exe_path": vina_exe_path,
+            "ligand_id": ligand_id,
+            "receptor_id": receptor_id,
+            "ligand_pdbqt": ligand_pdbqt,
+            "receptor_pdbqt": receptor_pdbqt,
+            "box": box,
+            "log_path": log_path,
+            "pose_path": pose_path,
+            "timeout": timeout,
+            "exhaustiveness": exhaustiveness,
+            "num_modes": num_modes,
+            "seed": seed,
+        })
 
-        if seed is not None:
-            cmd.extend(["--seed", str(seed)])
+    # Determine parallelism level and per-job CPU allocation
+    if n_workers is None:
+        ncpu_avail = os.cpu_count() or 1
+        n_workers = max(1, ncpu_avail // n_cpu)
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        with open(log_path, "w") as f:
-            f.write(result.stdout)
-            if result.stderr:
-                f.write(result.stderr)
+    n_cpu_per_job = max(1, n_cpu // n_workers) if n_workers > 1 else n_cpu
 
-        if result.returncode == 0:
-            n_done += 1
-            print(f"  [{n_done + n_skipped}/{n_total}] {ligand_id} x {receptor_id} done")
-        else:
-            n_failed += 1
-            print(f"  FAILED: {ligand_id} x {receptor_id}: {result.stderr[:200]}")
+    for task in task_list:
+        task["n_cpu"] = n_cpu_per_job
+
+    if n_workers <= 1:
+        # Sequential fallback — identical behavior to the original loop
+        for task in task_list:
+            result = _run_single_docking_task(task)
+            if result["status"] == "done":
+                n_done += 1
+                print(f"  [{n_done + n_skipped}/{n_total}] {result['ligand_id']} x {result['receptor_id']} done")
+            else:
+                n_failed += 1
+                print(f"  FAILED: {result['ligand_id']} x {result['receptor_id']}: {result.get('error', '')}")
+    else:
+        # Parallel execution via thread pool
+        print(f"[docking] Running {len(task_list)} tasks with {n_workers} workers ({n_cpu_per_job} CPU per job)")
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(_run_single_docking_task, task) for task in task_list]
+            for future in as_completed(futures):
+                result = future.result()
+                if result["status"] == "done":
+                    n_done += 1
+                    print(f"  [{n_done + n_skipped}/{n_total}] {result['ligand_id']} x {result['receptor_id']} done")
+                else:
+                    n_failed += 1
+                    print(f"  FAILED: {result['ligand_id']} x {result['receptor_id']}: {result.get('error', '')}")
 
     elapsed = time.time() - start
     elapsed_min = elapsed / 60.0

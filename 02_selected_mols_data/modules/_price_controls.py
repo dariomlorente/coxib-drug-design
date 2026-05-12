@@ -154,6 +154,67 @@ def save_price_control_outputs(
     return paths
 
 
+# =============================================================================
+# PriceController
+# =============================================================================
+
+
+class PriceController:
+    """
+    Applies price-based filtering and acceptance-rate controls.
+
+    Wraps apply_price_controls(). Stores max_price, acceptance_rate,
+    max_sample_size, and price_col at construction time so the same
+    controller can be applied consistently to both Imidazolones and
+    Thiazolones.
+
+    Parameters
+    ----------
+    max_price : float or None, optional
+        Maximum price per molecule. Default: None.
+    acceptance_rate : float or None, optional
+        Fraction of compounds to keep (0–1). Default: None.
+    max_sample_size : int or None, optional
+        Hard cap on accepted compounds. Default: None.
+    price_col : str, optional
+        Column name for prices. Default: "PriceMol".
+    """
+
+    def __init__(
+        self,
+        max_price: float | None = None,
+        acceptance_rate: float | None = None,
+        max_sample_size: int | None = None,
+        price_col: str = "PriceMol",
+    ) -> None:
+        self.max_price = max_price
+        self.acceptance_rate = acceptance_rate
+        self.max_sample_size = max_sample_size
+        self.price_col = price_col
+
+    def apply(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Apply price-based filtering and acceptance-rate controls.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with a ``price_col`` column.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame]
+            (accepted, rejected) DataFrames.
+        """
+        return apply_price_controls(
+            df,
+            price_col=self.price_col,
+            max_price=self.max_price,
+            acceptance_rate=self.acceptance_rate,
+            max_sample_size=self.max_sample_size,
+        )
+
+
 def run_clustering_input_export(
     df_imidazolones_druglike: pd.DataFrame,
     df_thiazolones_druglike: pd.DataFrame,

@@ -352,3 +352,151 @@ def run_qsar_winnow(
     }
 
     return outputs, paths
+
+
+# =============================================================================
+# QSARPipeline
+# =============================================================================
+
+
+class QSARPipeline:
+    """
+    Trains Random Forest QSAR models on ChEMBL IC50 data and scores new
+    compounds.
+
+    Wraps _prepare_qsar_training_data(), _train_qsar_models(),
+    _predict_qsar_for_series(), _select_top_by_qsar_score(), and
+    run_qsar_winnow(). Models are loaded from cache if available.
+
+    Parameters
+    ----------
+    chembl_path : str or Path, default=INPUT_IC50
+        Path to ChEMBL IC50 summary CSV.
+    acceptance_rate : float, default=0.01
+        Fraction of top-scoring compounds to keep per series.
+    minimum : int, default=1000
+        Minimum number of compounds to keep per series.
+    output_dir : str or Path, default=QSAR_DIR
+        Directory for QSAR output files.
+    use_cache : bool, default=True
+        Load/save trained models from disk cache.
+    cache_file : str or Path or None, default=None
+        Explicit model cache path. Auto-generated if None.
+    """
+
+    def __init__(
+        self,
+        chembl_path: str | Path = INPUT_IC50,
+        acceptance_rate: float = 0.01,
+        minimum: int = 1000,
+        output_dir: str | Path = QSAR_DIR,
+        use_cache: bool = True,
+        cache_file: str | Path | None = None,
+    ) -> None:
+        self.chembl_path = chembl_path
+        self.acceptance_rate = acceptance_rate
+        self.minimum = minimum
+        self.output_dir = output_dir
+        self.use_cache = use_cache
+        self.cache_file = cache_file
+        self._fitted: bool = False
+        self._models: dict[str, object] | None = None
+
+    def fit(self, force_retrain: bool = False) -> QSARPipeline:
+        """
+        Train or load cached QSAR models.
+
+        If use_cache is True and a cached model file exists, loads from
+        cache. Otherwise trains new models and optionally saves them.
+
+        Parameters
+        ----------
+        force_retrain : bool, default=False
+            Ignore cache and retrain models from scratch.
+
+        Returns
+        -------
+        QSARPipeline
+            Self, with self._models populated and self._fitted set to True.
+        """
+        output_dir = Path(self.output_dir)
+
+        cache_path: Path | None = None
+        if self.use_cache:
+            if self.cache_file is None:
+                cache_path = output_dir / ".cache" / "qsar_models.json.gz"
+            else:
+                cache_path = Path(self.cache_file)
+
+        models: dict[str, object] | None = None
+        if cache_path is not None and not force_retrain:
+            models = _load_qsar_model_cache(cache_path)
+
+        if models is None:
+            df_chembl = _prepare_qsar_training_data(self.chembl_path)
+            models = _train_qsar_models(df_chembl)
+            if cache_path is not None:
+                _save_qsar_model_cache(cache_path, df_chembl)
+
+        self._models = models
+        self._fitted = True
+        return self
+
+    def predict(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """
+        Predict COX-1/2 activity and selectivity for a compound series.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Compound DataFrame with SMILES column.
+        label : str
+            Series label for logging (e.g. 'Imidazolones', 'Thiazolones').
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with prediction columns appended.
+
+        Raises
+        ------
+        RuntimeError
+            If .fit() has not been called before .predict().
+        """
+        if not self._fitted or self._models is None:
+            raise RuntimeError("Call .fit() before .predict()")
+        return _predict_qsar_for_series(df, label, self._models)
+
+    def winnow(
+        self,
+        df_imidazolones: pd.DataFrame,
+        df_thiazolones: pd.DataFrame,
+    ) -> tuple[dict[str, pd.DataFrame], dict[str, Path]]:
+        """
+        Run the full QSAR winnow pipeline on both compound series.
+
+        Convenience wrapper around run_qsar_winnow() using the configured
+        parameters.
+
+        Parameters
+        ----------
+        df_imidazolones : pd.DataFrame
+            Drug-like imidazolone compounds.
+        df_thiazolones : pd.DataFrame
+            Drug-like thiazolone compounds.
+
+        Returns
+        -------
+        tuple[dict[str, pd.DataFrame], dict[str, Path]]
+            (outputs_dict, paths_dict) as returned by run_qsar_winnow().
+        """
+        return run_qsar_winnow(
+            df_imidazolones,
+            df_thiazolones,
+            chembl_path=self.chembl_path,
+            acceptance_rate=self.acceptance_rate,
+            minimum=self.minimum,
+            output_dir=self.output_dir,
+            use_cache=self.use_cache,
+            cache_file=self.cache_file,
+        )

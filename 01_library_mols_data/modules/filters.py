@@ -554,3 +554,279 @@ def filter_BrenkPAINS(
         print(f"[filter_BrenkPAINS] Rejected: Brenk={n_brenk_rejected}, PAINS={n_pains_rejected}")
 
     return df_accepted, df_rejected
+
+
+# =============================================================================
+# VeberFilter
+# =============================================================================
+
+
+class VeberFilter:
+    """
+    Applies Veber-style physicochemical property filters to a compound DataFrame.
+
+    Wraps filter_Veber(). Stores filter parameters as instance attributes set at
+    construction time, so the same configured filter object can be reused across
+    multiple DataFrames.
+
+    Parameters mirror the keyword arguments of filter_Veber() exactly.
+
+    Parameters
+    ----------
+    max_tPSA : float or None, default=90
+        Topological PSA upper limit (A^2, includes S and P).
+    max_RotB : int or None, default=10
+        Rotatable bonds upper limit.
+    max_LogP : float or None, default=3
+        Crippen LogP upper limit.
+    min_tPSA : float or None, default=None
+        Topological PSA lower limit (A^2).
+    max_MWT : float or None, default=None
+        Molecular weight upper limit (Da).
+    max_HBD : int or None, default=None
+        H-bond donors upper limit.
+    max_HBA : int or None, default=None
+        H-bond acceptors upper limit.
+    min_MR : float or None, default=None
+        Molecular refractivity lower limit.
+    max_MR : float or None, default=None
+        Molecular refractivity upper limit.
+    min_HvyAtm : int or None, default=None
+        Heavy atom count lower limit (inclusive).
+    max_HvyAtm : int or None, default=None
+        Heavy atom count upper limit (inclusive).
+    min_LogP : float or None, default=None
+        Crippen LogP lower limit.
+    max_Rings : int or None, default=None
+        Ring count upper limit.
+    min_CAtm : int or None, default=None
+        Carbon atom count lower limit (exclusive, strictly >).
+    min_HetAtm : int or None, default=None
+        Heteroatom count lower limit (exclusive, strictly >).
+    max_price_mol : float or None, default=None
+        Price-per-molecule upper limit (inclusive).
+    recompute_descriptors : bool, default=False
+        Drop existing descriptor columns and recompute.
+    smiles_col : str, default="SMILES"
+        Column name for SMILES strings.
+    id_col : str, default="ID"
+        Column name for compound IDs.
+    print_report : bool, default=True
+        Print acceptance/rejection summary.
+    use_cache : bool, default=True
+        Use persistent cache for calculated properties.
+    cache_file : Path or str or None, default=None
+        Cache file path (auto-generated if None).
+    output_csv : Path or str or None, default=None
+        If provided, stream accepted rows to this CSV.
+    filter_chunk_size : int or None, default=None
+        Chunk size for streaming when output_csv is used.
+    """
+
+    def __init__(
+        self,
+        max_tPSA: float | None = 90,
+        max_RotB: int | None = 10,
+        max_LogP: float | None = 3,
+        min_tPSA: float | None = None,
+        max_MWT: float | None = None,
+        max_HBD: int | None = None,
+        max_HBA: int | None = None,
+        min_MR: float | None = None,
+        max_MR: float | None = None,
+        min_HvyAtm: int | None = None,
+        max_HvyAtm: int | None = None,
+        min_LogP: float | None = None,
+        max_Rings: int | None = None,
+        min_CAtm: int | None = None,
+        min_HetAtm: int | None = None,
+        max_price_mol: float | None = None,
+        recompute_descriptors: bool = False,
+        smiles_col: str = "SMILES",
+        id_col: str = "ID",
+        print_report: bool = True,
+        use_cache: bool = True,
+        cache_file: Path | str | None = None,
+        output_csv: Path | str | None = None,
+        filter_chunk_size: int | None = None,
+    ) -> None:
+        self.max_tPSA = max_tPSA
+        self.max_RotB = max_RotB
+        self.max_LogP = max_LogP
+        self.min_tPSA = min_tPSA
+        self.max_MWT = max_MWT
+        self.max_HBD = max_HBD
+        self.max_HBA = max_HBA
+        self.min_MR = min_MR
+        self.max_MR = max_MR
+        self.min_HvyAtm = min_HvyAtm
+        self.max_HvyAtm = max_HvyAtm
+        self.min_LogP = min_LogP
+        self.max_Rings = max_Rings
+        self.min_CAtm = min_CAtm
+        self.min_HetAtm = min_HetAtm
+        self.max_price_mol = max_price_mol
+        self.recompute_descriptors = recompute_descriptors
+        self.smiles_col = smiles_col
+        self.id_col = id_col
+        self.print_report = print_report
+        self.use_cache = use_cache
+        self.cache_file = cache_file
+        self.output_csv = output_csv
+        self.filter_chunk_size = filter_chunk_size
+
+    def apply(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Apply the Veber filter to a compound DataFrame.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with at least ``id_col``, ``smiles_col``, and ``PriceMol``.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame]
+            (accepted, rejected) DataFrames.
+        """
+        return filter_Veber(
+            df,
+            max_tPSA=self.max_tPSA,
+            max_RotB=self.max_RotB,
+            max_LogP=self.max_LogP,
+            min_tPSA=self.min_tPSA,
+            max_MWT=self.max_MWT,
+            max_HBD=self.max_HBD,
+            max_HBA=self.max_HBA,
+            min_MR=self.min_MR,
+            max_MR=self.max_MR,
+            min_HvyAtm=self.min_HvyAtm,
+            max_HvyAtm=self.max_HvyAtm,
+            min_LogP=self.min_LogP,
+            max_Rings=self.max_Rings,
+            min_CAtm=self.min_CAtm,
+            min_HetAtm=self.min_HetAtm,
+            max_price_mol=self.max_price_mol,
+            recompute_descriptors=self.recompute_descriptors,
+            smiles_col=self.smiles_col,
+            id_col=self.id_col,
+            print_report=self.print_report,
+            use_cache=self.use_cache,
+            cache_file=self.cache_file,
+            output_csv=self.output_csv,
+            filter_chunk_size=self.filter_chunk_size,
+        )
+
+
+# =============================================================================
+# BrenkPAINSFilter
+# =============================================================================
+
+
+class BrenkPAINSFilter:
+    """
+    Applies Brenk structural alert and PAINS substructure filters.
+
+    Wraps filter_BrenkPAINS(). Compiles SMARTS patterns once at
+    initialisation via the module-level _compile_brenk_pains_patterns()
+    and stores the results, reusing them across all .apply() calls.
+
+    Parameters
+    ----------
+    smiles_col : str, default="SMILES"
+        Column name for SMILES strings.
+    id_col : str, default="ID"
+        Column name for compound IDs.
+    print_report : bool, default=True
+        Print acceptance/rejection summary.
+    n_workers : int or None, default=None
+        Number of parallel workers (default: cpu_count - 1).
+    """
+
+    def __init__(
+        self,
+        smiles_col: str = "SMILES",
+        id_col: str = "ID",
+        print_report: bool = True,
+        n_workers: int | None = None,
+    ) -> None:
+        self.smiles_col = smiles_col
+        self.id_col = id_col
+        self.print_report = print_report
+        self.n_workers = n_workers
+        self._compiled_brenk, self._compiled_pains = _compile_brenk_pains_patterns()
+
+    def apply(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Apply Brenk / PAINS substructure filters to a compound DataFrame.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with ``smiles_col`` and ``id_col``.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame]
+            (accepted, rejected) DataFrames.
+        """
+        return filter_BrenkPAINS(
+            df,
+            smiles_col=self.smiles_col,
+            id_col=self.id_col,
+            print_report=self.print_report,
+            n_workers=self.n_workers,
+        )
+
+
+# =============================================================================
+# FilterPipeline
+# =============================================================================
+
+
+class FilterPipeline:
+    """
+    Chains VeberFilter and BrenkPAINSFilter into a single sequential pipeline.
+
+    Parameters
+    ----------
+    veber_filter : VeberFilter or None, default=None
+        Configured VeberFilter instance. Created with defaults if None.
+    brenk_pains_filter : BrenkPAINSFilter or None, default=None
+        Configured BrenkPAINSFilter instance. Created with defaults if None.
+    """
+
+    def __init__(
+        self,
+        veber_filter: VeberFilter | None = None,
+        brenk_pains_filter: BrenkPAINSFilter | None = None,
+    ) -> None:
+        self.veber_filter = veber_filter if veber_filter is not None else VeberFilter()
+        self.brenk_pains_filter = brenk_pains_filter if brenk_pains_filter is not None else BrenkPAINSFilter()
+        self.veber_accepted: pd.DataFrame | None = None
+        self.veber_rejected: pd.DataFrame | None = None
+        self.brenk_pains_accepted: pd.DataFrame | None = None
+        self.brenk_pains_rejected: pd.DataFrame | None = None
+
+    def run(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Run the full filter pipeline on a compound DataFrame.
+
+        Applies Veber filter first, then Brenk/PAINS filter on the
+        Veber-accepted compounds. Results are stored as instance attributes.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with at least ``id_col``, ``smiles_col``, and ``PriceMol``.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+            (final_accepted, veber_rejected, brenk_pains_rejected).
+        """
+        self.veber_accepted, self.veber_rejected = self.veber_filter.apply(df)
+        self.brenk_pains_accepted, self.brenk_pains_rejected = self.brenk_pains_filter.apply(
+            self.veber_accepted
+        )
+        return self.brenk_pains_accepted, self.veber_rejected, self.brenk_pains_rejected

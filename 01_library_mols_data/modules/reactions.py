@@ -805,6 +805,7 @@ def rxn_SulphurExchange(
     use_cache: bool = True,
     cache_file: str | Path | None = None,
     print_report: bool = True,
+    n_workers: int | None = None,
     output_csv: str | Path | None = None,
     checkpoint_csv: str | Path | None = None,
     chunk_size: int = 1000,
@@ -825,6 +826,7 @@ def rxn_SulphurExchange(
         use_cache: Use persistent cache (default: True).
         cache_file: Cache file path (default: auto-generated).
         print_report: Print statistics (default: True).
+        n_workers: Number of parallel workers (default: cpu_count - 1).
         output_csv: If provided, write final result to this CSV file.
         checkpoint_csv: Legacy parameter (ignored if checkpoint_manager provided).
         chunk_size: Number of oxazolones per chunk for checkpointing (default: 1000).
@@ -1047,10 +1049,10 @@ def rxn_SulphurExchange(
                 f"({len(chunk_items):,} items)"
             )
 
-        n_workers = _get_n_workers(None)
-        if len(chunk_items) >= 1000 and n_workers > 1:
+        n_workers_resolved = _get_n_workers(n_workers)
+        if len(chunk_items) >= 1000 and n_workers_resolved > 1:
             chunk_oxazolones = [valid_oxazolones[i] for i in chunk_items]
-            batch_size = max(1, len(chunk_oxazolones) // n_workers)
+            batch_size = max(1, len(chunk_oxazolones) // n_workers_resolved)
             batches = [
                 chunk_oxazolones[i : i + batch_size]
                 for i in range(0, len(chunk_oxazolones), batch_size)
@@ -1064,7 +1066,7 @@ def rxn_SulphurExchange(
 
             import multiprocessing as mp
 
-            with mp.Pool(processes=n_workers) as pool:
+            with mp.Pool(processes=n_workers_resolved) as pool:
                 results = pool.map(worker_fn, batches)
 
             chunk_rows: list[dict] = []
@@ -1140,5 +1142,197 @@ def rxn_SulphurExchange(
         print(_format_reaction_stats(stats, "SulphurExchange"))
 
     return out_df
+
+
+# =============================================================================
+# ReactionPipeline
+# =============================================================================
+
+
+class ReactionPipeline:
+    """
+    Orchestrates the full three-step synthesis route in a single configurable
+    object.
+
+    Route: aldehydes + carboxylic acids → oxazolones (EP)
+                                       → thiazolones (SE)
+            oxazolones + amines        → imidazolones (AG)
+
+    Wraps rxn_ErlenmeyerPlochl(), rxn_AminolysisGFPc(), and
+    rxn_SulphurExchange(). Shared configuration is stored at construction
+    time and forwarded to every reaction call.  Per-call overrides are
+    supported via ``**kwargs``.
+
+    Parameters
+    ----------
+    max_price_mol : float or None, optional
+        Hard price cutoff forwarded to all three reactions. Default: None.
+    n_workers : int or None, optional
+        Parallel workers forwarded to EP and AG reactions. Default: None.
+    use_cache : bool, optional
+        Enable reaction caches. Default: True.
+    chunk_size : int, optional
+        Chunk size forwarded to EP and SE reactions. Default: 25.
+    """
+
+    def __init__(
+        self,
+        max_price_mol: float | None = None,
+        n_workers: int | None = None,
+        use_cache: bool = True,
+        chunk_size: int = 25,
+    ) -> None:
+        self.max_price_mol = max_price_mol
+        self.n_workers = n_workers
+        self.use_cache = use_cache
+        self.chunk_size = chunk_size
+        self.df_oxazolones: pd.DataFrame | None = None
+        self.df_imidazolones: pd.DataFrame | None = None
+        self.df_thiazolones: pd.DataFrame | None = None
+
+    def run_ep(
+        self,
+        df_aldehyde: pd.DataFrame,
+        df_carboxylic: pd.DataFrame,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """
+        Run the Erlenmeyer-Plöchl (EP) reaction.
+
+        Delegates to rxn_ErlenmeyerPlochl().  Instance-level config is used
+        as defaults; per-call ``**kwargs`` override individual parameters.
+
+        Parameters
+        ----------
+        df_aldehyde : pd.DataFrame
+            Aldehyde building blocks.
+        df_carboxylic : pd.DataFrame
+            Carboxylic acid building blocks.
+        **kwargs
+            Additional keyword arguments forwarded to rxn_ErlenmeyerPlochl(),
+            overriding instance defaults.
+
+        Returns
+        -------
+        pd.DataFrame
+            Oxazolone products.
+        """
+        config: dict[str, Any] = {
+            "max_price_mol": self.max_price_mol,
+            "n_workers": self.n_workers,
+            "use_cache": self.use_cache,
+            "chunk_size": self.chunk_size,
+        }
+        config.update(kwargs)
+        return rxn_ErlenmeyerPlochl(df_aldehyde, df_carboxylic, **config)
+
+    def run_ag(
+        self,
+        df_oxazolones: pd.DataFrame,
+        df_amines: pd.DataFrame,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """
+        Run the Aminolysis-GFPc (AG) reaction.
+
+        Delegates to rxn_AminolysisGFPc().  Instance-level config is used
+        as defaults; per-call ``**kwargs`` override individual parameters.
+
+        Parameters
+        ----------
+        df_oxazolones : pd.DataFrame
+            Oxazolone intermediates.
+        df_amines : pd.DataFrame
+            Primary amine building blocks.
+        **kwargs
+            Additional keyword arguments forwarded to rxn_AminolysisGFPc(),
+            overriding instance defaults.
+
+        Returns
+        -------
+        pd.DataFrame
+            Imidazolone products.
+        """
+        config: dict[str, Any] = {
+            "max_price_mol": self.max_price_mol,
+            "n_workers": self.n_workers,
+            "use_cache": self.use_cache,
+            "chunk_size": self.chunk_size,
+        }
+        config.update(kwargs)
+        return rxn_AminolysisGFPc(df_oxazolones, df_amines, **config)
+
+    def run_se(
+        self,
+        df_oxazolones: pd.DataFrame,
+        thioacetic_price_eq: float,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """
+        Run the Sulphur-Exchange (SE) reaction.
+
+        Delegates to rxn_SulphurExchange().  Instance-level config is used
+        as defaults; per-call ``**kwargs`` override individual parameters.
+
+        Parameters
+        ----------
+        df_oxazolones : pd.DataFrame
+            Oxazolone intermediates.
+        thioacetic_price_eq : float
+            Price per equivalent of thioacetic acid reagent.
+        **kwargs
+            Additional keyword arguments forwarded to rxn_SulphurExchange(),
+            overriding instance defaults.
+
+        Returns
+        -------
+        pd.DataFrame
+            Thiazolone products.
+        """
+        config: dict[str, Any] = {
+            "max_price_mol": self.max_price_mol,
+            "n_workers": self.n_workers,
+            "use_cache": self.use_cache,
+            "chunk_size": self.chunk_size,
+        }
+        config.update(kwargs)
+        return rxn_SulphurExchange(df_oxazolones, thioacetic_price_eq, **config)
+
+    def run_full(
+        self,
+        df_aldehyde: pd.DataFrame,
+        df_carboxylic: pd.DataFrame,
+        df_amines: pd.DataFrame,
+        thioacetic_price_eq: float,
+        **kwargs: Any,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Run the complete three-step synthesis route.
+
+        Executes EP → AG and EP → SE in sequence, storing intermediate
+        results as instance attributes.
+
+        Parameters
+        ----------
+        df_aldehyde : pd.DataFrame
+            Aldehyde building blocks.
+        df_carboxylic : pd.DataFrame
+            Carboxylic acid building blocks.
+        df_amines : pd.DataFrame
+            Primary amine building blocks.
+        thioacetic_price_eq : float
+            Price per equivalent of thioacetic acid reagent.
+        **kwargs
+            Additional keyword arguments forwarded to each reaction.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+            (df_imidazolones, df_thiazolones, df_oxazolones).
+        """
+        self.df_oxazolones = self.run_ep(df_aldehyde, df_carboxylic, **kwargs)
+        self.df_imidazolones = self.run_ag(self.df_oxazolones, df_amines, **kwargs)
+        self.df_thiazolones = self.run_se(self.df_oxazolones, thioacetic_price_eq, **kwargs)
+        return self.df_imidazolones, self.df_thiazolones, self.df_oxazolones
 
 

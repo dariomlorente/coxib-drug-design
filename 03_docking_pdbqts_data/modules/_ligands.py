@@ -251,3 +251,100 @@ def prepare_ligands_multi_conf(
     if failures:
         print(f"[prepare_ligands_multi_conf] Failed IDs: {', '.join(failures)}")
     return out
+
+
+# =============================================================================
+# LigandPreparator
+# =============================================================================
+
+
+class LigandPreparator:
+    """
+    Prepares 3D ligand conformers and PDBQT files for docking.
+
+    Wraps prepare_ligands() and prepare_ligands_multi_conf(). Stores seed,
+    n_confs, smiles_col, and id_col at construction time so the same
+    preparator can be reused across multiple compound series.
+
+    Parameters
+    ----------
+    seed : int, optional
+        Random seed for ETKDGv3 conformer generation. Default: 42.
+    n_confs : int, optional
+        Number of conformers for multi-conformer preparation. Default: 15.
+    smiles_col : str, optional
+        Column name for SMILES strings. Default: "SMILES".
+    id_col : str, optional
+        Column name for compound IDs. Default: "ID".
+    """
+
+    def __init__(
+        self,
+        seed: int = 42,
+        n_confs: int = 15,
+        smiles_col: str = "SMILES",
+        id_col: str = "ID",
+    ) -> None:
+        self.seed = seed
+        self.n_confs = n_confs
+        self.smiles_col = smiles_col
+        self.id_col = id_col
+
+    def prepare(
+        self,
+        df: pd.DataFrame,
+        ligands_dir: str | Path,
+    ) -> pd.DataFrame:
+        """
+        Generate 3D conformers and PDBQT files.
+
+        Delegates to prepare_ligands() with stored parameters.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with ID and SMILES columns.
+        ligands_dir : str or Path
+            Output directory for .sdf and .pdbqt files.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with added 'sdf_path' and 'pdbqt_path' columns.
+        """
+        return prepare_ligands(
+            df, ligands_dir,
+            smiles_col=self.smiles_col,
+            id_col=self.id_col,
+            seed=self.seed,
+        )
+
+    def prepare_multi_conf(
+        self,
+        df: pd.DataFrame,
+        ligands_dir: str | Path,
+    ) -> pd.DataFrame:
+        """
+        Generate multi-conformer 3D structures and PDBQT files.
+
+        Delegates to prepare_ligands_multi_conf() with stored parameters.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with ID and SMILES columns.
+        ligands_dir : str or Path
+            Output directory for .pdbqt files.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with added 'pdbqt_path' column.
+        """
+        return prepare_ligands_multi_conf(
+            df, ligands_dir,
+            smiles_col=self.smiles_col,
+            id_col=self.id_col,
+            seed=self.seed,
+            n_confs=self.n_confs,
+        )

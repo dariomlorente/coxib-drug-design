@@ -208,3 +208,83 @@ def plot_qed_histograms(
     fig.suptitle("QED distribution after bioavailability filter")
     plt.tight_layout()
     return fig, (axes[0], axes[1])
+
+
+# =============================================================================
+# BioavailabilityFilter
+# =============================================================================
+
+
+class BioavailabilityFilter:
+    """
+    Applies the 4-of-5 drug-likeness rules filter (Lipinski, Ghose, Egan,
+    Muegge, Veber).
+
+    Wraps filter_bioavailability() and plot_qed_histograms().
+
+    Parameters
+    ----------
+    qed_col : str, default="QED"
+        Column name for QED scores.
+    violation_col : str, default="Violation"
+        Column name for violation details.
+    """
+
+    def __init__(
+        self,
+        qed_col: str = "QED",
+        violation_col: str = "Violation",
+    ) -> None:
+        self.qed_col = qed_col
+        self.violation_col = violation_col
+
+    def apply(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Apply the 4-of-5 bioavailability rules filter.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame with QED and bioavailability descriptor columns.
+
+        Returns
+        -------
+        tuple[pd.DataFrame, pd.DataFrame]
+            (accepted, rejected) DataFrames.
+        """
+        return filter_bioavailability(
+            df,
+            qed_col=self.qed_col,
+            violation_col=self.violation_col,
+        )
+
+    def plot_qed(
+        self,
+        df_accepted: pd.DataFrame,
+        df_rejected: pd.DataFrame,
+    ) -> tuple[object, tuple[object, object]]:
+        """
+        Plot QED histograms for accepted vs rejected compounds.
+
+        Delegates to plot_qed_histograms(), passing the same DataFrame to
+        both the imidazolone and thiazolone slots.
+
+        Parameters
+        ----------
+        df_accepted : pd.DataFrame
+            Accepted compounds DataFrame.
+        df_rejected : pd.DataFrame
+            Rejected compounds DataFrame.
+
+        Returns
+        -------
+        tuple[Figure, tuple[Axes, Axes]]
+            Matplotlib figure and axes tuple.
+        """
+        return plot_qed_histograms(
+            df_accepted,
+            df_accepted,
+            df_rejected,
+            df_rejected,
+            qed_col=self.qed_col,
+        )

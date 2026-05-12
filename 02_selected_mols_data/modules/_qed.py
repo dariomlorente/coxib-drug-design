@@ -122,3 +122,65 @@ def load_or_compute_qed(
         print(f"[load_or_compute_qed] Saved {cache_path.name} ({len(with_qed):,} rows)")
 
     return with_qed, cache_path
+
+
+# =============================================================================
+# QEDCalculator
+# =============================================================================
+
+
+class QEDCalculator:
+    """
+    Computes QED scores for a compound DataFrame with optional caching.
+
+    Wraps add_qed_column() and load_or_compute_qed().
+
+    Parameters
+    ----------
+    cache_dir : str or Path, default=QED_CACHE
+        Directory for caching QED results.
+    precision : int, default=4
+        Decimal precision for QED scores.
+    n_workers : int or None, default=None
+        Number of parallel workers for multiprocessing.
+    """
+
+    def __init__(
+        self,
+        cache_dir: str | Path = QED_CACHE,
+        precision: int = 4,
+        n_workers: int | None = None,
+    ) -> None:
+        self.cache_dir = cache_dir
+        self.precision = precision
+        self.n_workers = n_workers
+
+    def compute(
+        self,
+        df: pd.DataFrame,
+        stage_name: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Compute QED scores, optionally using disk caching.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with 'SMILES' and 'PriceMol' columns.
+        stage_name : str or None, default=None
+            If provided, uses load_or_compute_qed() for disk-cached results.
+            If None, calls add_qed_column() directly.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with QED column added.
+        """
+        if stage_name is not None:
+            result, _ = load_or_compute_qed(
+                df,
+                stage_name=stage_name,
+                cache_dir=self.cache_dir,
+            )
+            return result
+        return add_qed_column(df, precision=self.precision, n_workers=self.n_workers)

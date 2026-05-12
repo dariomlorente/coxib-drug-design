@@ -192,3 +192,62 @@ def add_rdkit_properties(
         out[col] = [results_dict.get(idx, {}).get(col, None) for idx in range(len(out))]
 
     return out
+
+
+# =============================================================================
+# SDFLoader
+# =============================================================================
+
+
+class SDFLoader:
+    """
+    Loads an SDF file and optionally computes RDKit descriptors.
+
+    Wraps sdf_to_dataframe() and add_rdkit_properties(). Stores id_prefix,
+    id_prop, and n_workers at construction time so the same loader can be
+    reused for multiple SDF files of the same building-block type.
+
+    Parameters
+    ----------
+    id_prefix : str
+        Prefix for generated IDs (e.g. 'A' for aldehydes, 'C' for carboxylics).
+    id_prop : str, optional
+        SDF property name containing the catalog ID. Default: "Catalog_ID".
+    n_workers : int or None, optional
+        Number of parallel workers for descriptor calculation. Default: None.
+    """
+
+    def __init__(
+        self,
+        id_prefix: str,
+        id_prop: str = "Catalog_ID",
+        n_workers: int | None = None,
+    ) -> None:
+        self.id_prefix = id_prefix
+        self.id_prop = id_prop
+        self.n_workers = n_workers
+
+    def load(
+        self,
+        sdf_path: str,
+        compute_descriptors: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Load an SDF file and optionally compute RDKit descriptors.
+
+        Parameters
+        ----------
+        sdf_path : str
+            Path to the SDF file.
+        compute_descriptors : bool, optional
+            If True, compute RDKit descriptors after loading. Default: False.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with ID, Catalog_ID, SMILES and optionally descriptor columns.
+        """
+        df = sdf_to_dataframe(sdf_path, id_prefix=self.id_prefix, id_prop=self.id_prop)
+        if compute_descriptors:
+            df = add_rdkit_properties(df, n_workers=self.n_workers)
+        return df

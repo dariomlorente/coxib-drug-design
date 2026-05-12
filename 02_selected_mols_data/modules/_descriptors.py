@@ -185,3 +185,56 @@ def ensure_required_bioavailability_columns(
         print(f"[Descriptors] Added missing columns: {', '.join(missing)}")
 
     return out
+
+
+# =============================================================================
+# DescriptorCalculator
+# =============================================================================
+
+
+class DescriptorCalculator:
+    """
+    Computes RDKit physicochemical descriptors for a compound DataFrame.
+
+    Wraps add_rdkit_properties() and ensure_required_bioavailability_columns().
+
+    Parameters
+    ----------
+    n_workers : int or None, default=None
+        Number of parallel workers. Uses cpu_count - 1 if None.
+    """
+
+    def __init__(self, n_workers: int | None = None) -> None:
+        self.n_workers = n_workers
+
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute the full set of RDKit descriptors.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with a 'SMILES' column.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with descriptor columns added.
+        """
+        return add_rdkit_properties(df, n_workers=self.n_workers)
+
+    def ensure(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ensure missing bioavailability descriptor columns are present.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input DataFrame with a 'SMILES' column.
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with any missing bioavailability columns filled.
+        """
+        return ensure_required_bioavailability_columns(df)

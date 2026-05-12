@@ -8,17 +8,22 @@ from .io import (
     report_df_size,
     save_dataframe_as_csv,
     add_rdkit_properties,
+    SDFLoader,
 )
 
 from .filters import (
     filter_Veber,
     filter_BrenkPAINS,
+    VeberFilter,
+    BrenkPAINSFilter,
+    FilterPipeline,
 )
 
 from .reactions import (
     rxn_ErlenmeyerPlochl,
     rxn_AminolysisGFPc,
     rxn_SulphurExchange,
+    ReactionPipeline,
 )
 
 from .enamine_api import (

@@ -14,12 +14,14 @@ from ._io import (
 from ._descriptors import (
     DESCRIPTOR_COLUMNS,
     ensure_required_bioavailability_columns,
+    DescriptorCalculator,
 )
 
 # ── QED scoring ───────────────────────────────────────────────────────
 from ._qed import (
     add_qed_column,
     load_or_compute_qed,
+    QEDCalculator,
 )
 
 # ── Bioavailability filtering ─────────────────────────────────────────
@@ -27,6 +29,7 @@ from ._bioavailability import (
     filter_bioavailability,
     save_bioavailability_outputs,
     plot_qed_histograms,
+    BioavailabilityFilter,
 )
 
 # ── Price controls ────────────────────────────────────────────────────
@@ -34,6 +37,7 @@ from ._price_controls import (
     apply_price_controls,
     save_price_control_outputs,
     run_clustering_input_export,
+    PriceController,
 )
 
 # ── QSAR scoring primitives ───────────────────────────────────────────
@@ -50,6 +54,7 @@ from ._qsar_scoring import (
 # ── QSAR model training and winnowing ─────────────────────────────────
 from ._qsar_models import (
     run_qsar_winnow,
+    QSARPipeline,
 )
 
 # ── Clustering (public API) ───────────────────────────────────────────
@@ -88,4 +93,5 @@ from .prediction import (
     merge_ic50_summary,
     merge_ic50_into_csv,
     find_chembl_ids_by_smarts,
+    IC50Analyzer,
 )
